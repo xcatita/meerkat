@@ -237,7 +237,7 @@ mod tests {
         };
         let result = eval(&func_expr, &env, &mut ctx).await.unwrap();
         match result {
-            Value::Closure { params, body: _, env: captured_env } => {
+            Value::Closure { params, body: _, env: captured_env, .. } => {
                 assert_eq!(params.len(), 1);
                 assert_eq!(captured_env.len(), 1);
                 assert_eq!(captured_env[0].0, "a");
