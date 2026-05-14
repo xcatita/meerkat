@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use crate::runtime::txn::{TxnId, VarLock};
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use super::ast::{Value, Decl, Expr, ActionStmt};
@@ -12,6 +13,10 @@ pub struct Service {
     pub vars: HashMap<String, Value>,   // vars + evaluated def values
     pub defs: HashMap<String, Expr>,    // original def expressions for re-evaluation
     pub dep: DependAnalysis,            // dependency graph + topo order
+    /// Per-variable lock state for 2-phase locking
+    pub var_locks: HashMap<String, VarLock>,
+    /// Most recent transaction to write each variable
+    pub latest_write_txn: HashMap<String, TxnId>,
 }
 
 pub struct Manager {
@@ -44,6 +49,8 @@ impl Manager {
             vars: HashMap::new(),
             defs: HashMap::new(),
             dep,
+            var_locks: HashMap::new(),
+            latest_write_txn: HashMap::new(),
         };
 
         let mut env: Vec<(String, Value)> = vec![];
@@ -342,19 +349,139 @@ impl Manager {
         }
     }
 
+    /// Try to acquire a write lock on a service variable.
+    /// Returns LockConflict if the variable is already locked.
+    fn acquire_write_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name)
+            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
+        let lock = service.var_locks.entry(var.to_string()).or_insert(VarLock::new());
+        if lock.try_write(txn_id) {
+            Ok(())
+        } else {
+            Err(EvalError::LockConflict(format!(
+                "Variable '{}' is already locked; cannot acquire write lock for txn {:?}", var, txn_id
+            )))
+        }
+    }
+
+    /// Try to acquire a read lock on a service variable.
+    /// Returns LockConflict if a write lock is held.
+    fn acquire_read_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name)
+            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
+        let lock = service.var_locks.entry(var.to_string()).or_insert(VarLock::new());
+        if lock.try_read(txn_id) {
+            Ok(())
+        } else {
+            Err(EvalError::LockConflict(format!(
+                "Variable '{}' is write-locked by another transaction", var
+            )))
+        }
+    }
+
+    /// Release all locks held by txn_id on the given variables.
+    fn release_locks(&mut self, service_name: &str, vars: &HashSet<String>, txn_id: &TxnId) {
+        if let Some(service) = self.services.get_mut(service_name) {
+            for var in vars {
+                if let Some(lock) = service.var_locks.get_mut(var) {
+                    lock.release(txn_id);
+                }
+            }
+        }
+    }
+
+    /// Execute action statements as a transaction using 2-phase locking:
+    ///
+    /// Phase 1 — acquire all locks upfront before executing anything.
+    /// Phase 2 — execute the statements.
+    /// Phase 3 — commit: record latest_write_txn for each written variable.
+    /// Phase 4 — release all locks (always, even on error).
+    ///
+    /// Deadlock prevention (wait-die) is deferred to a follow-up issue.
+    /// If a lock cannot be acquired, the transaction fails immediately.
+    pub async fn run_test_with_txn(
+        &mut self,
+        service_name: &str,
+        stmts: &[ActionStmt],
+        initial_env: &[(String, Value)],
+    ) -> Result<(), EvalError> {
+        let txn_id = TxnId::new();
+
+        // Collect service variable names for this service
+        let service_vars: HashSet<String> = self.services.get(service_name)
+            .map(|s| s.vars.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Write vars: Assign targets that are service vars
+        let write_vars: HashSet<String> = stmts.iter()
+            .filter_map(|stmt| match stmt {
+                ActionStmt::Assign { var, .. } if service_vars.contains(var) => Some(var.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Read vars: free vars in all expressions that are service vars, excluding write vars
+        // (write lock already covers the read for that variable)
+        let action_expr = crate::runtime::ast::Expr::Action(stmts.to_vec());
+        let read_vars: HashSet<String> = action_expr
+            .free_var(&HashSet::new(), &HashSet::new())
+            .into_iter()
+            .filter(|v| service_vars.contains(v) && !write_vars.contains(v))
+            .collect();
+
+        // Phase 1: Acquire all locks before executing anything
+        let mut locked: HashSet<String> = HashSet::new();
+
+        for var in &write_vars {
+            if let Err(e) = self.acquire_write_lock(service_name, var, &txn_id) {
+                self.release_locks(service_name, &locked, &txn_id);
+                return Err(e);
+            }
+            locked.insert(var.clone());
+        }
+        for var in &read_vars {
+            if let Err(e) = self.acquire_read_lock(service_name, var, &txn_id) {
+                self.release_locks(service_name, &locked, &txn_id);
+                return Err(e);
+            }
+            locked.insert(var.clone());
+        }
+
+        // Phase 2: Execute statements
+        let mut env: Vec<(String, Value)> = initial_env.to_vec();
+        let mut exec_error: Option<EvalError> = None;
+        for stmt in stmts {
+            match execute(stmt, &env, self, service_name).await {
+                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
+                Ok(_) => {}
+                Err(e) => { exec_error = Some(e); break; }
+            }
+        }
+
+        // Phase 3: Commit — record latest write transaction for each written var
+        if exec_error.is_none() {
+            if let Some(service) = self.services.get_mut(service_name) {
+                for var in &write_vars {
+                    service.latest_write_txn.insert(var.clone(), txn_id.clone());
+                }
+            }
+        }
+
+        // Phase 4: Release all locks (always, even on error)
+        self.release_locks(service_name, &locked, &txn_id);
+
+        match exec_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     pub async fn run_test(&mut self, service_name: &str, stmts: &[ActionStmt]) -> Result<(), EvalError> {
-        self.run_test_with_env(service_name, stmts, &[]).await
+        self.run_test_with_txn(service_name, stmts, &[]).await
     }
 
     pub async fn run_test_with_env(&mut self, service_name: &str, stmts: &[ActionStmt], initial_env: &[(String, Value)]) -> Result<(), EvalError> {
-        let mut env: Vec<(String, Value)> = initial_env.to_vec();
-        for stmt in stmts {
-            match execute(stmt, &env, self, service_name).await? {
-                ExecuteEffect::Binding(name, val) => env.push((name, val)),
-                ExecuteEffect::None | ExecuteEffect::ExprValue(_) => {}
-            }
-        }
-        Ok(())
+        self.run_test_with_txn(service_name, stmts, initial_env).await
     }
 }
 
