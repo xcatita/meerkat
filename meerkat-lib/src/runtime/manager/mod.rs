@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use crate::runtime::txn::{TxnId, VarState};
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use super::ast::{Value, Decl, Expr, ActionStmt};
@@ -9,7 +10,8 @@ use crate::net::network_layer::NetworkLayer;
 
 pub struct Service {
     pub name: String,
-    pub vars: HashMap<String, Value>,   // vars + evaluated def values
+    /// Per-variable state: value, lock, and latest write transaction in one place
+    pub vars: HashMap<String, VarState>,
     pub defs: HashMap<String, Expr>,    // original def expressions for re-evaluation
     pub dep: DependAnalysis,            // dependency graph + topo order
 }
@@ -54,12 +56,12 @@ impl Manager {
                 Decl::VarDecl { name, val } => {
                     let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
                     env.push((name.clone(), value.clone()));
-                    service.vars.insert(name, value);
+                    service.vars.insert(name, VarState::new(value));
                 }
                 Decl::DefDecl { name, val, .. } => {
                     let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
                     env.push((name.clone(), value.clone()));
-                    service.vars.insert(name.clone(), value);
+                    service.vars.insert(name.clone(), VarState::new(value));
                     service.defs.insert(name, val);  // store original expr
                 }
                 Decl::TableDecl { .. } => {
@@ -86,15 +88,15 @@ impl Manager {
         if let Some(expr) = def_expr {
             let env: Vec<(String, Value)> = self.services
                 .get(service_name)
-                .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect())
                 .unwrap_or_default();
             return eval(&expr, &env, &mut EvalContext { manager: self, service_name }).await;
         }
 
         // Otherwise return stored var value
         if let Some(service) = self.services.get(service_name) {
-            if let Some(value) = service.vars.get(ident) {
-                return Ok(value.clone());
+            if let Some(var_state) = service.vars.get(ident) {
+                return Ok(var_state.value.clone());
             }
         }
         Err(EvalError::LookupError(format!("Variable '{}' not found in service '{}'", ident, service_name)))
@@ -103,8 +105,8 @@ impl Manager {
     pub async fn assign(&mut self, service_name: &str, var: &str, value: Value) -> Result<(), EvalError> {
         // update the var
         if let Some(service) = self.services.get_mut(service_name) {
-            if service.vars.contains_key(var) {
-                service.vars.insert(var.to_string(), value);
+            if let Some(var_state) = service.vars.get_mut(var) {
+                var_state.value = value;
             } else {
                 return Err(EvalError::LookupError(format!("Variable '{}' not found in service '{}'", var, service_name)));
             }
@@ -145,13 +147,15 @@ impl Manager {
                 if let Some(expr) = expr {
                     let env: Vec<(String, Value)> = self.services
                         .get(service_name)
-                        .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                        .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect())
                         .unwrap_or_default();
 
                     let value = eval(&expr, &env, &mut EvalContext { manager: self, service_name }).await?;
 
                     if let Some(service) = self.services.get_mut(service_name) {
-                        service.vars.insert(def_name, value);
+                        if let Some(var_state) = service.vars.get_mut(&def_name) {
+                            var_state.value = value;
+                        }
                     }
                 }
             }
@@ -342,19 +346,144 @@ impl Manager {
         }
     }
 
-    pub async fn run_test(&mut self, service_name: &str, stmts: &[ActionStmt]) -> Result<(), EvalError> {
-        self.run_test_with_env(service_name, stmts, &[]).await
+    /// Try to acquire a write lock on a service variable.
+    /// Returns LockConflict if the variable is already locked.
+    fn acquire_write_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name)
+            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
+        let var_state = service.vars.get_mut(var)
+            .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
+        if var_state.lock.try_write(txn_id) {
+            Ok(())
+        } else {
+            Err(EvalError::LockConflict(format!(
+                "Variable '{}' is already locked; cannot acquire write lock", var
+            )))
+        }
     }
 
-    pub async fn run_test_with_env(&mut self, service_name: &str, stmts: &[ActionStmt], initial_env: &[(String, Value)]) -> Result<(), EvalError> {
-        let mut env: Vec<(String, Value)> = initial_env.to_vec();
-        for stmt in stmts {
-            match execute(stmt, &env, self, service_name).await? {
-                ExecuteEffect::Binding(name, val) => env.push((name, val)),
-                ExecuteEffect::None | ExecuteEffect::ExprValue(_) => {}
+    /// Try to acquire a read lock on a service variable.
+    /// Returns LockConflict if a write lock is held.
+    fn acquire_read_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name)
+            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
+        let var_state = service.vars.get_mut(var)
+            .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
+        if var_state.lock.try_read(txn_id) {
+            Ok(())
+        } else {
+            Err(EvalError::LockConflict(format!(
+                "Variable '{}' is write-locked by another transaction", var
+            )))
+        }
+    }
+
+    /// Release all locks held by txn_id on the given variables.
+    fn release_locks(&mut self, service_name: &str, vars: &HashSet<String>, txn_id: &TxnId) {
+        if let Some(service) = self.services.get_mut(service_name) {
+            for var in vars {
+                if let Some(var_state) = service.vars.get_mut(var) {
+                    var_state.lock.release(txn_id);
+                }
             }
         }
-        Ok(())
+    }
+
+    /// Execute action statements as a transaction using 2-phase locking:
+    ///
+    /// Phase 1 — acquire all locks upfront before executing anything.
+    /// Phase 2 — execute the statements.
+    /// Phase 3 — commit: record latest_write_txn for each written variable.
+    /// Phase 4 — release all locks (always, even on error).
+    ///
+    /// Deadlock prevention (wait-die) is deferred to a follow-up issue.
+    /// If a lock cannot be acquired, the transaction fails immediately.
+    pub async fn execute_action_with_txn(
+        &mut self,
+        service_name: &str,
+        stmts: &[ActionStmt],
+        initial_env: &[(String, Value)],
+    ) -> Result<(), EvalError> {
+        let txn_id = TxnId::new();
+
+        // Collect service variable names for this service
+        let service_vars: HashSet<String> = self.services.get(service_name)
+            .map(|s| s.vars.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // Write vars: Assign targets that are service vars
+        // TODO: also include ActionStmt::Insert targets once Insert is implemented
+        let write_vars: HashSet<String> = stmts.iter()
+            .filter_map(|stmt| match stmt {
+                ActionStmt::Assign { var, .. } if service_vars.contains(var) => Some(var.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Read vars: free vars in all expressions that are service vars, excluding write vars
+        // (write lock already covers the read for that variable)
+        let action_expr = crate::runtime::ast::Expr::Action(stmts.to_vec());
+        let read_vars: HashSet<String> = action_expr
+            .free_var(&HashSet::new(), &HashSet::new())
+            .into_iter()
+            .filter(|v| service_vars.contains(v) && !write_vars.contains(v))
+            .collect();
+
+        // Phase 1: Acquire all locks before executing anything
+        let mut locked: HashSet<String> = HashSet::new();
+
+        for var in &write_vars {
+            if let Err(e) = self.acquire_write_lock(service_name, var, &txn_id) {
+                self.release_locks(service_name, &locked, &txn_id);
+                return Err(e);
+            }
+            locked.insert(var.clone());
+        }
+        for var in &read_vars {
+            if let Err(e) = self.acquire_read_lock(service_name, var, &txn_id) {
+                self.release_locks(service_name, &locked, &txn_id);
+                return Err(e);
+            }
+            locked.insert(var.clone());
+        }
+
+        // Phase 2: Execute statements
+        let mut env: Vec<(String, Value)> = initial_env.to_vec();
+        let mut exec_error: Option<EvalError> = None;
+        for stmt in stmts {
+            match execute(stmt, &env, self, service_name).await {
+                Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
+                Ok(_) => {}
+                Err(e) => { exec_error = Some(e); break; }
+            }
+        }
+
+        // Phase 3: Commit — record latest write transaction for each written var
+        if exec_error.is_none() {
+            if let Some(service) = self.services.get_mut(service_name) {
+                for var in &write_vars {
+                    if let Some(var_state) = service.vars.get_mut(var) {
+                        var_state.latest_write_txn = Some(txn_id.clone());
+                    }
+                }
+            }
+        }
+
+        // Phase 4: Release all locks (always, even on error)
+        self.release_locks(service_name, &locked, &txn_id);
+
+        match exec_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    pub async fn execute_action(&mut self, service_name: &str, stmts: &[ActionStmt]) -> Result<(), EvalError> {
+        self.execute_action_with_txn(service_name, stmts, &[]).await
+    }
+
+    pub async fn execute_action_with_env(&mut self, service_name: &str, stmts: &[ActionStmt], initial_env: &[(String, Value)]) -> Result<(), EvalError> {
+        self.execute_action_with_txn(service_name, stmts, initial_env).await
     }
 }
 

@@ -10,6 +10,7 @@ pub enum EvalError {
     NetworkError(String),
     LookupError(String),
     NotImplemented,
+    LockConflict(String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -19,6 +20,7 @@ impl std::fmt::Display for EvalError {
             EvalError::NetworkError(s) => write!(f, "Network error: {}", s),
             EvalError::LookupError(s) => write!(f, "Lookup error: {}", s),
             EvalError::NotImplemented => write!(f, "Not yet implemented"),
+            EvalError::LockConflict(s) => write!(f, "Lock conflict: {}", s),
         }
     }
 }
