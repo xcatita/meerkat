@@ -22,7 +22,7 @@ async fn check_watches(watches: &mut Vec<Watch>, manager: &mut Manager, repl_env
         let result = eval(
             &w.expr,
             repl_env,
-            &mut EvalContext { manager, service_name: "" },
+            &mut EvalContext { manager, service_name: "", txn: None },
         ).await;
         match result {
             Ok(new_val) => {
@@ -167,7 +167,7 @@ async fn exec_stmt(
             Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
         }
         Stmt::ActionStmt(action_stmt) => {
-            let effect = execute(&action_stmt, repl_env, manager, "")
+            let effect = execute(&action_stmt, repl_env, manager, "", None)
                 .await
                 .map_err(|e| format!("{}", e))?;
             match effect {
@@ -185,7 +185,7 @@ async fn exec_stmt(
             let initial = eval(
                 &expr,
                 repl_env,
-                &mut EvalContext { manager, service_name: "" },
+                &mut EvalContext { manager, service_name: "", txn: None },
             ).await.ok();
             let msg = match &initial {
                 Some(v) => format!("Watching: {} (current value: {})", label, v),

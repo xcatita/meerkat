@@ -3,6 +3,7 @@ use crate::ast::{
 };
 use std::collections::HashSet;
 use crate::runtime::manager::Manager;
+use crate::runtime::txn::Transaction;
 
 #[derive(Debug)]
 pub enum EvalError {
@@ -33,6 +34,8 @@ impl std::error::Error for EvalError {}
 pub struct EvalContext<'a> {
     pub manager: &'a mut Manager,
     pub service_name: &'a str,
+    /// Active transaction, if evaluation is happening inside one.
+    pub txn: Option<&'a mut Transaction>,
 }
 
 #[async_recursion::async_recursion]
@@ -56,7 +59,7 @@ pub async fn eval(
                     for (param, arg_val) in params.iter().zip(arg_vals) {
                         new_env.push((param.clone(), arg_val));
                     }
-                    eval(&body, &new_env, &mut EvalContext { manager: ctx.manager, service_name: &closure_svc }).await
+                    eval(&body, &new_env, &mut EvalContext { manager: ctx.manager, service_name: &closure_svc, txn: ctx.txn.as_deref_mut() }).await
                 }
                 _ => Err(EvalError::TypeError("Attempting to call a non-function value".to_string())),
             }
@@ -68,7 +71,7 @@ pub async fn eval(
                     return Ok(var_val.clone());
                 }
             }
-            ctx.manager.lookup(ident, ctx.service_name).await
+            ctx.manager.lookup(ident, ctx.service_name, ctx.txn.as_deref_mut()).await
         }
 
         Expr::Binop { op, expr1, expr2 } => {
@@ -149,7 +152,7 @@ pub async fn eval(
 
         Expr::MemberAccess { service, member } => {
             // Manager figures out whether service is local or remote
-            ctx.manager.lookup(member, service).await
+            ctx.manager.lookup(member, service, ctx.txn.as_deref_mut()).await
         }
         _ => Err(EvalError::NotImplemented),
     }
@@ -164,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn test_literal() {
         let mut manager = Manager::default();
-        let mut ctx = EvalContext { manager: &mut manager, service_name: "" };
+        let mut ctx = EvalContext { manager: &mut manager, service_name: "", txn: None };
         let expr = Expr::Literal { val: Value::Number { val: 42 } };
         let result = eval(&expr, &[], &mut ctx).await.unwrap();
         assert_eq!(result, Value::Number { val: 42 });
@@ -173,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_binop_add() {
         let mut manager = Manager::default();
-        let mut ctx = EvalContext { manager: &mut manager, service_name: "" };
+        let mut ctx = EvalContext { manager: &mut manager, service_name: "", txn: None };
         let expr = Expr::Binop {
             op: BinOp::Add,
             expr1: Box::new(Expr::Literal { val: Value::Number { val: 2 } }),
@@ -186,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn test_func_and_call() {
         let mut manager = Manager::default();
-        let mut ctx = EvalContext { manager: &mut manager, service_name: "" };
+        let mut ctx = EvalContext { manager: &mut manager, service_name: "", txn: None };
         let func_expr = Expr::Func {
             params: vec!["x".to_string()],
             body: Box::new(Expr::Binop {
@@ -206,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn test_action_creation() {
         let mut manager = Manager::default();
-        let mut ctx = EvalContext { manager: &mut manager, service_name: "" };
+        let mut ctx = EvalContext { manager: &mut manager, service_name: "", txn: None };
         let action_expr = Expr::Action(vec![
             ActionStmt::Assign {
                 var: "x".to_string(),
@@ -223,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn test_closure_captures_only_free_vars() {
         let mut manager = Manager::default();
-        let mut ctx = EvalContext { manager: &mut manager, service_name: "" };
+        let mut ctx = EvalContext { manager: &mut manager, service_name: "", txn: None };
         let env = vec![
             ("a".to_string(), Value::Number { val: 1 }),
             ("b".to_string(), Value::Number { val: 2 }),

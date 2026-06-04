@@ -1,5 +1,6 @@
 use crate::ast::{Value, ActionStmt};
 use crate::runtime::Manager;
+use crate::runtime::txn::Transaction;
 use super::evaluator::{eval, EvalContext, EvalError};
 
 /// The effect produced by executing a single statement.
@@ -18,25 +19,28 @@ pub async fn execute(
     env: &[(String, Value)],
     manager: &mut Manager,
     service_name: &str,
+    mut txn: Option<&mut Transaction>,
 ) -> Result<ExecuteEffect, EvalError> {
     match stmt {
         ActionStmt::Assign { var, expr } => {
-            let value = eval(expr, env, &mut EvalContext { manager, service_name }).await?;
-            manager.assign(service_name, var, value).await?;
+            let value = eval(expr, env, &mut EvalContext { manager, service_name, txn: txn.as_deref_mut() }).await?;
+            manager.assign(service_name, var, value, txn).await?;
             Ok(ExecuteEffect::None)
         }
         ActionStmt::Do(expr) => {
-            let val = eval(expr, env, &mut EvalContext { manager, service_name }).await?;
+            let val = eval(expr, env, &mut EvalContext { manager, service_name, txn: txn.as_deref_mut() }).await?;
             match val {
                 Value::ActionClosure { stmts, env: closure_env, service_name: action_svc } => {
                     if manager.remote_services.contains_key(&action_svc) {
+                        // Remote actions don't yet participate in the local
+                        // transaction; distributed lock coordination is future work.
                         manager.remote_action(&action_svc, stmts, closure_env).await?;
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     } else {
                         let mut exec_env = closure_env.clone();
                         for s in &stmts {
                             if let ExecuteEffect::Binding(name, val) =
-                                execute(s, &exec_env, manager, &action_svc).await?
+                                execute(s, &exec_env, manager, &action_svc, txn.as_deref_mut()).await?
                             {
                                 exec_env.push((name, val));
                             }
@@ -48,7 +52,7 @@ pub async fn execute(
             }
         }
         ActionStmt::Assert(expr) => {
-            let val = eval(expr, env, &mut EvalContext { manager, service_name }).await?;
+            let val = eval(expr, env, &mut EvalContext { manager, service_name, txn: txn.as_deref_mut() }).await?;
             match val {
                 Value::Bool { val: true } => Ok(ExecuteEffect::None),
                 Value::Bool { val: false } => Err(EvalError::TypeError("Assertion failed".to_string())),
@@ -56,11 +60,11 @@ pub async fn execute(
             }
         }
         ActionStmt::Let { name, expr } => {
-            let val = eval(expr, env, &mut EvalContext { manager, service_name }).await?;
+            let val = eval(expr, env, &mut EvalContext { manager, service_name, txn: txn.as_deref_mut() }).await?;
             Ok(ExecuteEffect::Binding(name.clone(), val))
         }
         ActionStmt::Expr(expr) => {
-            let val = eval(expr, env, &mut EvalContext { manager, service_name }).await?;
+            let val = eval(expr, env, &mut EvalContext { manager, service_name, txn: txn.as_deref_mut() }).await?;
             Ok(ExecuteEffect::ExprValue(val))
         }
         ActionStmt::Insert { .. } => Err(EvalError::NotImplemented),

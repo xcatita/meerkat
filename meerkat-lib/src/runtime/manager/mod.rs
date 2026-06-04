@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use crate::runtime::txn::{TxnId, VarState};
+use crate::runtime::txn::{TxnId, VarState, Transaction};
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use super::ast::{Value, Decl, Expr, ActionStmt};
@@ -54,12 +54,12 @@ impl Manager {
         for decl in decls {
             match decl {
                 Decl::VarDecl { name, val } => {
-                    let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
+                    let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name, txn: None }).await?;
                     env.push((name.clone(), value.clone()));
                     service.vars.insert(name, VarState::new(value));
                 }
                 Decl::DefDecl { name, val, .. } => {
-                    let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name }).await?;
+                    let value = eval(&val, &env, &mut EvalContext { manager: self, service_name: &svc_name, txn: None }).await?;
                     env.push((name.clone(), value.clone()));
                     service.vars.insert(name.clone(), VarState::new(value));
                     service.defs.insert(name, val);  // store original expr
@@ -74,36 +74,85 @@ impl Manager {
         Ok(())
     }
 
-    pub async fn lookup(&mut self, ident: &str, service_name: &str) -> Result<Value, EvalError> {
+    pub async fn lookup(&mut self, ident: &str, service_name: &str, mut txn: Option<&mut Transaction>) -> Result<Value, EvalError> {
         // Check if service is remote
         if self.remote_services.contains_key(service_name) {
             return self.remote_lookup(service_name, ident).await;
         }
 
-        // If it's a def, re-evaluate from stored expression for freshness
+        // If it's a def, re-evaluate from stored expression for freshness.
+        // The transaction flows through so the def's underlying vars are locked.
         let def_expr = self.services.get(service_name)
             .and_then(|s| s.defs.get(ident))
             .cloned();
 
         if let Some(expr) = def_expr {
-            let env: Vec<(String, Value)> = self.services
-                .get(service_name)
-                .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect())
-                .unwrap_or_default();
-            return eval(&expr, &env, &mut EvalContext { manager: self, service_name }).await;
+            // Evaluate the def with an empty env so its dependencies resolve
+            // through lookup (acquiring read locks and populating the cache)
+            // rather than being pre-seeded from current service var values.
+            let env: Vec<(String, Value)> = Vec::new();
+            return eval(&expr, &env, &mut EvalContext { manager: self, service_name, txn: txn.as_deref_mut() }).await;
         }
 
-        // Otherwise return stored var value
+        // Local var read. If inside a transaction, return the cached value if
+        // present, otherwise acquire a read lock lazily and cache the value.
+        // Decide what's needed first (ending the txn borrow) before calling
+        // self.acquire_read_lock, then re-borrow txn to record the lock.
+        let mut need_read_lock: Option<TxnId> = None;
+        if let Some(t) = txn.as_deref() {
+            if let Some(cached) = t.read_cache.get(ident) {
+                return Ok(cached.clone());
+            }
+            if !t.locked.contains(ident) {
+                need_read_lock = Some(t.id.clone());
+            }
+        }
+        if let Some(txn_id) = need_read_lock {
+            self.acquire_read_lock(service_name, ident, &txn_id)?;
+            if let Some(t) = txn.as_deref_mut() {
+                t.locked.insert(ident.to_string());
+            }
+        }
+
+        // Return stored var value (and cache it for the transaction)
         if let Some(service) = self.services.get(service_name) {
             if let Some(var_state) = service.vars.get(ident) {
-                return Ok(var_state.value.clone());
+                let value = var_state.value.clone();
+                if let Some(t) = txn.as_deref_mut() {
+                    t.read_cache.insert(ident.to_string(), value.clone());
+                }
+                return Ok(value);
             }
         }
         Err(EvalError::LookupError(format!("Variable '{}' not found in service '{}'", ident, service_name)))
     }
 
-    pub async fn assign(&mut self, service_name: &str, var: &str, value: Value) -> Result<(), EvalError> {
-        // update the var
+    pub async fn assign(&mut self, service_name: &str, var: &str, value: Value, mut txn: Option<&mut Transaction>) -> Result<(), EvalError> {
+        // Inside a transaction: acquire the write lock lazily (upgrading from a
+        // read lock for read-then-write patterns like x = x + 1) and buffer the
+        // write. The buffered value is applied to the service only at commit, so
+        // a transaction that fails partway leaves no partial writes behind.
+        if txn.is_some() {
+            enum LockAction { Acquire, Upgrade }
+            let (txn_id, kind) = {
+                let t = txn.as_deref().unwrap();
+                let kind = if t.locked.contains(var) { LockAction::Upgrade } else { LockAction::Acquire };
+                (t.id.clone(), kind)
+            };
+            match kind {
+                LockAction::Upgrade => self.upgrade_to_write_lock(service_name, var, &txn_id)?,
+                LockAction::Acquire => self.acquire_write_lock(service_name, var, &txn_id)?,
+            }
+            if let Some(t) = txn.as_deref_mut() {
+                t.locked.insert(var.to_string());
+                t.written.insert(var.to_string(), value.clone());
+                // Reads later in the same transaction see the buffered write
+                t.read_cache.insert(var.to_string(), value);
+            }
+            return Ok(());
+        }
+
+        // Non-transactional path: apply the write immediately and propagate.
         if let Some(service) = self.services.get_mut(service_name) {
             if let Some(var_state) = service.vars.get_mut(var) {
                 var_state.value = value;
@@ -150,7 +199,7 @@ impl Manager {
                         .map(|s| s.vars.iter().map(|(k, v)| (k.clone(), v.value.clone())).collect())
                         .unwrap_or_default();
 
-                    let value = eval(&expr, &env, &mut EvalContext { manager: self, service_name }).await?;
+                    let value = eval(&expr, &env, &mut EvalContext { manager: self, service_name, txn: None }).await?;
 
                     if let Some(service) = self.services.get_mut(service_name) {
                         if let Some(var_state) = service.vars.get_mut(&def_name) {
@@ -378,6 +427,22 @@ impl Manager {
         }
     }
 
+    /// Upgrade a read lock to a write lock on a service variable.
+    /// Used for read-then-write within the same transaction (e.g. x = x + 1).
+    fn upgrade_to_write_lock(&mut self, service_name: &str, var: &str, txn_id: &TxnId) -> Result<(), EvalError> {
+        let service = self.services.get_mut(service_name)
+            .ok_or_else(|| EvalError::LookupError(format!("Service '{}' not found", service_name)))?;
+        let var_state = service.vars.get_mut(var)
+            .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
+        if var_state.lock.upgrade_to_write(txn_id) {
+            Ok(())
+        } else {
+            Err(EvalError::LockConflict(format!(
+                "Variable '{}' cannot be upgraded to a write lock; held by another transaction", var
+            )))
+        }
+    }
+
     /// Release all locks held by txn_id on the given variables.
     fn release_locks(&mut self, service_name: &str, vars: &HashSet<String>, txn_id: &TxnId) {
         if let Some(service) = self.services.get_mut(service_name) {
@@ -389,12 +454,17 @@ impl Manager {
         }
     }
 
-    /// Execute action statements as a transaction using 2-phase locking:
+    /// Execute action statements as a transaction with lazy lock acquisition:
     ///
-    /// Phase 1 — acquire all locks upfront before executing anything.
-    /// Phase 2 — execute the statements.
-    /// Phase 3 — commit: record latest_write_txn for each written variable.
-    /// Phase 4 — release all locks (always, even on error).
+    /// Locks are acquired on demand as each variable is first read or written
+    /// during execution (inside `lookup` and `assign`), rather than upfront.
+    /// This handles actions invoked via function calls and conditional branches,
+    /// where the set of accessed variables can't be determined statically.
+    /// Read values are cached in the transaction to avoid re-fetching (which
+    /// also avoids redundant network round-trips for remote reads).
+    ///
+    /// On completion: commit records latest_write_txn for written variables,
+    /// then all locks are released (always, even on error).
     ///
     /// Deadlock prevention (wait-die) is deferred to a follow-up issue.
     /// If a lock cannot be acquired, the transaction fails immediately.
@@ -404,75 +474,51 @@ impl Manager {
         stmts: &[ActionStmt],
         initial_env: &[(String, Value)],
     ) -> Result<(), EvalError> {
-        let txn_id = TxnId::new();
+        // The transaction owns all its state and is passed down through
+        // execution; nothing transaction-specific lives on the Manager.
+        let mut txn = Transaction::new(TxnId::new());
 
-        // Collect service variable names for this service
-        let service_vars: HashSet<String> = self.services.get(service_name)
-            .map(|s| s.vars.keys().cloned().collect())
-            .unwrap_or_default();
-
-        // Write vars: Assign targets that are service vars
-        // TODO: also include ActionStmt::Insert targets once Insert is implemented
-        let write_vars: HashSet<String> = stmts.iter()
-            .filter_map(|stmt| match stmt {
-                ActionStmt::Assign { var, .. } if service_vars.contains(var) => Some(var.clone()),
-                _ => None,
-            })
-            .collect();
-
-        // Read vars: free vars in all expressions that are service vars, excluding write vars
-        // (write lock already covers the read for that variable)
-        let action_expr = crate::runtime::ast::Expr::Action(stmts.to_vec());
-        let read_vars: HashSet<String> = action_expr
-            .free_var(&HashSet::new(), &HashSet::new())
-            .into_iter()
-            .filter(|v| service_vars.contains(v) && !write_vars.contains(v))
-            .collect();
-
-        // Phase 1: Acquire all locks before executing anything
-        let mut locked: HashSet<String> = HashSet::new();
-
-        for var in &write_vars {
-            if let Err(e) = self.acquire_write_lock(service_name, var, &txn_id) {
-                self.release_locks(service_name, &locked, &txn_id);
-                return Err(e);
-            }
-            locked.insert(var.clone());
-        }
-        for var in &read_vars {
-            if let Err(e) = self.acquire_read_lock(service_name, var, &txn_id) {
-                self.release_locks(service_name, &locked, &txn_id);
-                return Err(e);
-            }
-            locked.insert(var.clone());
-        }
-
-        // Phase 2: Execute statements
+        // Execute statements; read/write locks are acquired lazily inside
+        // lookup/assign as variables are accessed
         let mut env: Vec<(String, Value)> = initial_env.to_vec();
         let mut exec_error: Option<EvalError> = None;
         for stmt in stmts {
-            match execute(stmt, &env, self, service_name).await {
+            match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
                 Ok(ExecuteEffect::Binding(name, val)) => env.push((name, val)),
                 Ok(_) => {}
                 Err(e) => { exec_error = Some(e); break; }
             }
         }
 
-        // Phase 3: Commit — record latest write transaction for each written var
+        // Commit — apply the buffered writes to the service, record the writing
+        // transaction, then propagate to dependent defs. On execution error
+        // nothing is applied, so the transaction leaves no partial writes.
+        let mut commit_error: Option<EvalError> = None;
         if exec_error.is_none() {
-            if let Some(service) = self.services.get_mut(service_name) {
-                for var in &write_vars {
+            let writes: Vec<(String, Value)> = txn.written.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (var, value) in &writes {
+                if let Some(service) = self.services.get_mut(service_name) {
                     if let Some(var_state) = service.vars.get_mut(var) {
-                        var_state.latest_write_txn = Some(txn_id.clone());
+                        var_state.value = value.clone();
+                        var_state.latest_write_txn = Some(txn.id.clone());
                     }
+                }
+            }
+            // Propagate after all writes are applied so defs see a consistent state
+            for (var, _) in &writes {
+                if let Err(e) = self.propagate(service_name, var).await {
+                    commit_error = Some(e);
+                    break;
                 }
             }
         }
 
-        // Phase 4: Release all locks (always, even on error)
-        self.release_locks(service_name, &locked, &txn_id);
+        // Release all locks (always, even on error)
+        self.release_locks(service_name, &txn.locked, &txn.id);
 
-        match exec_error {
+        match exec_error.or(commit_error) {
             Some(e) => Err(e),
             None => Ok(()),
         }
@@ -508,7 +554,7 @@ mod tests {
             },
         ];
         manager.create_service("foo".to_string(), decls).await.unwrap();
-        let result = manager.lookup("x", "foo").await.unwrap();
+        let result = manager.lookup("x", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 1 });
     }
 
@@ -531,7 +577,7 @@ mod tests {
             },
         ];
         manager.create_service("foo".to_string(), decls).await.unwrap();
-        let result = manager.lookup("f", "foo").await.unwrap();
+        let result = manager.lookup("f", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 5 });
     }
 
@@ -539,7 +585,7 @@ mod tests {
     async fn test_lookup_missing_var_returns_error() {
         let mut manager = Manager::new();
         manager.create_service("foo".to_string(), vec![]).await.unwrap();
-        let result = manager.lookup("nonexistent", "foo").await;
+        let result = manager.lookup("nonexistent", "foo", None).await;
         assert!(result.is_err());
     }
 
@@ -565,12 +611,133 @@ mod tests {
         manager.create_service("foo".to_string(), decls).await.unwrap();
 
         // f should be 11 initially
-        let result = manager.lookup("f", "foo").await.unwrap();
+        let result = manager.lookup("f", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 11 });
 
         // update x to 5, f should become 15
-        manager.assign("foo", "x", Value::Number { val: 5 }).await.unwrap();
-        let result = manager.lookup("f", "foo").await.unwrap();
+        manager.assign("foo", "x", Value::Number { val: 5 }, None).await.unwrap();
+        let result = manager.lookup("f", "foo", None).await.unwrap();
         assert_eq!(result, Value::Number { val: 15 });
+    }
+
+    // Helper: service with a single var x = 0
+    async fn manager_with_x() -> Manager {
+        let mut manager = Manager::new();
+        let decls = vec![
+            Decl::VarDecl {
+                name: "x".to_string(),
+                val: Expr::Literal { val: Value::Number { val: 0 } },
+            },
+        ];
+        manager.create_service("foo".to_string(), decls).await.unwrap();
+        manager
+    }
+
+    // x = x + 1 reads x (read lock) then writes x (must upgrade to write lock).
+    // This is the read-then-write pattern that the old upfront analysis mishandled.
+    #[tokio::test]
+    async fn test_txn_read_then_write_upgrades_lock() {
+        let mut manager = manager_with_x().await;
+        let stmts = vec![
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
+                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
+                },
+            },
+        ];
+        manager.execute_action("foo", &stmts).await.unwrap();
+        let result = manager.lookup("x", "foo", None).await.unwrap();
+        assert_eq!(result, Value::Number { val: 1 });
+    }
+
+    // Locks must be released after a transaction, so a second transaction
+    // can acquire them. Running x = x + 1 twice should yield x == 2.
+    #[tokio::test]
+    async fn test_txn_locks_released_between_transactions() {
+        let mut manager = manager_with_x().await;
+        let stmts = vec![
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
+                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
+                },
+            },
+        ];
+        manager.execute_action("foo", &stmts).await.unwrap();
+        manager.execute_action("foo", &stmts).await.unwrap();
+        let result = manager.lookup("x", "foo", None).await.unwrap();
+        assert_eq!(result, Value::Number { val: 2 });
+    }
+
+    // After a transaction completes, the variable's lock should be Unlocked.
+    #[tokio::test]
+    async fn test_txn_var_unlocked_after_commit() {
+        let mut manager = manager_with_x().await;
+        let stmts = vec![
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Literal { val: Value::Number { val: 42 } },
+            },
+        ];
+        manager.execute_action("foo", &stmts).await.unwrap();
+        let lock = &manager.services.get("foo").unwrap().vars.get("x").unwrap().lock;
+        assert!(matches!(lock, crate::runtime::txn::VarLock::Unlocked));
+    }
+
+    // A nested `do` (an action invoking another action) must reuse the same
+    // transaction, not start a fresh one. The inner write to x should commit and
+    // all locks should be released afterward. This guards the bug where nested
+    // execution clobbered the outer transaction's lock tracking.
+    #[tokio::test]
+    async fn test_txn_nested_do_reuses_transaction() {
+        let mut manager = manager_with_x().await;
+        // outer action: do (action { x = x + 1; });
+        let inner = Expr::Action(vec![
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { ident: "x".to_string() }),
+                    expr2: Box::new(Expr::Literal { val: Value::Number { val: 1 } }),
+                },
+            },
+        ]);
+        let stmts = vec![ActionStmt::Do(inner)];
+        manager.execute_action("foo", &stmts).await.unwrap();
+
+        // inner write took effect
+        let result = manager.lookup("x", "foo", None).await.unwrap();
+        assert_eq!(result, Value::Number { val: 1 });
+        // and the lock was released
+        let lock = &manager.services.get("foo").unwrap().vars.get("x").unwrap().lock;
+        assert!(matches!(lock, crate::runtime::txn::VarLock::Unlocked));
+    }
+
+    // A transaction that fails partway must leave no partial writes: writes are
+    // buffered and applied only on a successful commit. Here the first statement
+    // writes x, the second fails (asserting false), so x must stay unchanged.
+    #[tokio::test]
+    async fn test_txn_failed_transaction_leaves_no_partial_writes() {
+        let mut manager = manager_with_x().await;
+        let stmts = vec![
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Literal { val: Value::Number { val: 99 } },
+            },
+            ActionStmt::Assert(Expr::Literal { val: Value::Bool { val: false } }),
+        ];
+        let result = manager.execute_action("foo", &stmts).await;
+        assert!(result.is_err());
+        // x must remain 0 — the buffered write to 99 was never committed
+        let x = manager.lookup("x", "foo", None).await.unwrap();
+        assert_eq!(x, Value::Number { val: 0 });
+        // and the lock was released
+        let lock = &manager.services.get("foo").unwrap().vars.get("x").unwrap().lock;
+        assert!(matches!(lock, crate::runtime::txn::VarLock::Unlocked));
     }
 }

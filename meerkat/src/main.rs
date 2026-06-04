@@ -133,7 +133,7 @@ async fn run_server(prog: Vec<Stmt>, remote_url_map: std::collections::HashMap<S
                 NetworkEvent::MessageReceived { peer: _, msg } => {
                     match msg {
                         MeerkatMessage::LookupRequest { request_id, service, member, reply_to } => {
-                            let result = manager.lookup(&member, &service).await;
+                            let result = manager.lookup(&member, &service, None).await;
                             let response = match result {
                                 Ok(val) => MeerkatMessage::LookupResponse {
                                     request_id,
