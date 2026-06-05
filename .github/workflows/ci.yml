@@ -32,6 +32,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check spelling
+        uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89  # v1.47.2
+
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
