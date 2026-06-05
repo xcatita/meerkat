@@ -9,14 +9,12 @@ Purpose:
   performs a clean shutdown of all background processes when completed.
 
 Usage:
-  python3 scripts/run_network.py [manifest_file_path]
-
-Default manifest:
-  scripts/default_manifest.mkn
+  python3 scripts/run_network.py manifest_file_path
 """
 
 import os
 import sys
+import argparse
 import time
 import subprocess
 import signal
@@ -130,13 +128,35 @@ def main():
     register_signals(processes)
 
     # Parse arguments
-    manifest_path = "scripts/default_manifest.mkn"
-    if len(sys.argv) > 1:
-        if sys.argv[1] in ("-h", "--help"):
-            print("Usage: python3 scripts/run_network.py [manifest_file_path]")
-            print("Default manifest: scripts/default_manifest.mkn")
-            exit_orchestrator(0, processes, "Displayed help menu")
-        manifest_path = sys.argv[1]
+    arg_parser = argparse.ArgumentParser(
+        description="Meerkat Network Orchestrator: orchestrates and tests multi-node, relay, and multi-hop distributed topologies for Meerkat.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Manifest file format:
+  Each line defines a node in the format:
+    node_name:file_path:port:imports
+
+  - node_name: Unique identifier for the node.
+  - file_path: Path to the Meerkat (.mkt) file.
+  - port: Port to listen on, or 'client' for a client-only node.
+  - imports: (Optional) Comma-separated list of node names this node imports.
+
+Example manifest:
+  node1: meerkat/tests/net_orch1.mkt: 9001:
+  node2: meerkat/tests/net_orch2.mkt: 9002: node1_a, node1_b
+  node3: meerkat/tests/net_orch3.mkt: client: node2
+"""
+    )
+    arg_parser.add_argument(
+        "manifest_file_path",
+        help="Path to the network manifest file"
+    )
+    if len(sys.argv) == 1:
+        arg_parser.print_help()
+        sys.exit(0)
+
+    args = arg_parser.parse_args()
+    manifest_path = args.manifest_file_path
 
     if not os.path.isfile(manifest_path):
         print(f"Error: Manifest file '{manifest_path}' not found.")
