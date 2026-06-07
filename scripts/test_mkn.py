@@ -2,6 +2,8 @@ import subprocess
 import json
 import sys
 import re
+import os
+import signal
 
 def run_cmd(args, timeout=30):
     """Runs a subprocess command with a timeout, redirecting stderr to stdout.
@@ -15,17 +17,54 @@ def run_cmd(args, timeout=30):
           - returncode: The exit code of the subprocess, or -1 on timeout.
           - output: The combined stdout and stderr of the process.
     """
+    is_windows = sys.platform == "win32"
+    kwargs = {}
+    
+    if is_windows:
+        # Create a new process group on Windows
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        # Create a new session (process group) on POSIX
+        kwargs["start_new_session"] = True
+
     try:
-        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
-        return proc.returncode, proc.stdout
-    except subprocess.TimeoutExpired as e:
+        proc = subprocess.Popen(
+            args, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, 
+            text=True, 
+            **kwargs
+        )
+        stdout, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout
+    except subprocess.TimeoutExpired:
         print(f"\nFAIL: Command timed out after {timeout} seconds: {' '.join(args)}")
-        stdout_decoded = e.stdout
-        if isinstance(stdout_decoded, bytes):
-            stdout_decoded = stdout_decoded.decode(errors="replace")
-        elif stdout_decoded is None:
-            stdout_decoded = ""
-        return -1, stdout_decoded
+        
+        # Terminate the entire process tree to prevent orphans
+        if is_windows:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+                
+        # Reap the process and capture any remaining partial output
+        stdout, _ = proc.communicate()
+        
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        elif stdout is None:
+            stdout = ""
+            
+        return -1, stdout
 
 def run_basic_test():
     """Runs integration test 1 (mkn_basic_topology) to verify a basic orchestrator setup."""
