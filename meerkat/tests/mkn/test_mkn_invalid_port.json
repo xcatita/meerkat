@@ -1,0 +1,11 @@
+{
+  "nodes": [
+    {
+      "alias": "client_node",
+      "type": "client",
+      "file": "meerkat/tests/mkn/mkn_client.mkt",
+      "port": 8080,
+      "imports": []
+    }
+  ]
+}

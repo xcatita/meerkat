@@ -1,0 +1,22 @@
+{
+  "settings": {
+    "startup_timeout": 10.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "relay_node",
+      "type": "server",
+      "file": "meerkat/tests/mkn/mkn_relay.mkt",
+      "port": 9012
+    },
+    {
+      "alias": "relayed_client",
+      "type": "client",
+      "cmd": ["python3", "meerkat/tests/mkn/mock_relayed_client.py"],
+      "relay": "relay_node",
+      "imports": ["relay_node.relay_svc"]
+    }
+  ]
+}

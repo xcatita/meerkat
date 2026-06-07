@@ -1,0 +1,65 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+    ":enablePreCommit"
+  ],
+  "timezone": "America/New_York",
+  "schedule": ["* 0 * * 0"],
+  "minimumReleaseAge": "7 days",
+  "abandonmentThreshold": "2 years",
+  "osvVulnerabilityAlerts": true,
+  "dependencyDashboardOSVVulnerabilitySummary": "all",
+  "vulnerabilityAlerts": {
+    "labels": ["security"],
+    "minimumReleaseAge": null
+  },
+  "configMigration": true,
+  "platformCommit": "enabled",
+  "rollbackPrs": true,
+  "separateMultipleMajor": true,
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 5,
+  "labels": ["dependencies"],
+  "rangeStrategy": "auto",
+  "semanticCommitType": "chore",
+  "semanticCommitScope": "deps",
+  "enabledManagers": [
+    "cargo",
+    "github-actions",
+    "pre-commit"
+  ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["* 0 * * 0"]
+  },
+  "packageRules": [
+    {
+      "description": "Label major updates",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major"]
+    },
+    {
+      "description": "Group Rust minor and patch updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "rust minor and patch dependencies"
+    },
+    {
+      "description": "Group pre-commit hook updates",
+      "matchManagers": ["pre-commit"],
+      "groupName": "pre-commit hooks"
+    },
+    {
+      "description": "Pin GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true
+    },
+    {
+      "description": "Group GitHub Actions non-major updates",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "github actions non-major dependencies"
+    }
+  ]
+}

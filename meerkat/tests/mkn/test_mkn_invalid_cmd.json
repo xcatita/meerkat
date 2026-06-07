@@ -1,0 +1,6 @@
+{
+  "settings": {},
+  "nodes": [
+    {"alias": "node1", "type": "server", "cmd": "python3 foo.py"}
+  ]
+}

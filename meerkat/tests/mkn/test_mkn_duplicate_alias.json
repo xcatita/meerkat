@@ -1,0 +1,7 @@
+{
+  "settings": {},
+  "nodes": [
+    {"alias": "node1", "type": "server", "file": "test.mkt"},
+    {"alias": "node1", "type": "client", "file": "test.mkt"}
+  ]
+}

@@ -1,0 +1,14 @@
+import server_svc
+
+service client_svc {
+    pub def do_inc = action {
+        do server_svc.inc_x;
+    };
+    pub def get_val = server_svc.get_x;
+}
+
+@test(client_svc) {
+    assert(get_val == 0);
+    do do_inc;
+    assert(get_val == 1);
+}

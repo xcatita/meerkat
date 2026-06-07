@@ -1,0 +1,6 @@
+{
+  "settings": {},
+  "nodes": [
+    {"alias": "node1", "type": "server", "file": "test.mkt", "relay": "node2"}
+  ]
+}

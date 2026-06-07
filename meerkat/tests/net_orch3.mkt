@@ -1,0 +1,18 @@
+import node2
+
+service node3 {
+    pub def do_inc_twice = action {
+        do node2.do_inc;
+        do node2.do_inc;
+    };
+    pub def get_val_x = node2.get_node1_x;
+    pub def get_val_y = node2.get_node1_y;
+}
+
+@test(node3) {
+    assert(get_val_x == 0);
+    assert(get_val_y == 100);
+    do do_inc_twice;
+    assert(get_val_x == 2);
+    assert(get_val_y == 98);
+}

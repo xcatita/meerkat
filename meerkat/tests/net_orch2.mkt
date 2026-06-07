@@ -1,0 +1,19 @@
+import node1_a
+import node1_b
+
+service node2 {
+    pub def do_inc = action {
+        do node1_a.inc_x;
+        do node1_b.dec_y;
+    };
+    pub def get_node1_x = node1_a.get_x;
+    pub def get_node1_y = node1_b.get_y;
+}
+
+@test(node2) {
+    assert(get_node1_x == 0);
+    assert(get_node1_y == 100);
+    do do_inc;
+    assert(get_node1_x == 1);
+    assert(get_node1_y == 99);
+}

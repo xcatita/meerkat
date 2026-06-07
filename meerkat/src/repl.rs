@@ -66,7 +66,12 @@ pub async fn run_repl(
         let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
             .await
             .map_err(|e| format!("Network error: {}", e))?;
-        let listen_addr = meerkat_lib::net::Address::new("/ip4/0.0.0.0/tcp/0");
+        let listen_ip = if manager.local {
+            "127.0.0.1"
+        } else {
+            "0.0.0.0"
+        };
+        let listen_addr = meerkat_lib::net::Address::new(&format!("/ip4/{}/tcp/0", listen_ip));
         n.handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
             .await;
         manager.network = Some(n);

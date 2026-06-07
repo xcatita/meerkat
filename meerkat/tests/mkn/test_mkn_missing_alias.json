@@ -1,0 +1,10 @@
+{
+  "nodes": [
+    {
+      "type": "server",
+      "file": "meerkat/tests/mkn/mkn_server.mkt",
+      "port": 9013,
+      "imports": []
+    }
+  ]
+}

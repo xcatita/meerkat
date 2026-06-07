@@ -1,0 +1,23 @@
+{
+  "settings": {
+    "startup_timeout": 10.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "basic_server",
+      "type": "server",
+      "file": "meerkat/tests/mkn/mkn_server.mkt",
+      "port": 9011,
+      "imports": []
+    },
+    {
+      "alias": "basic_client",
+      "type": "client",
+      "file": "meerkat/tests/mkn/mkn_client.mkt",
+      "timeout": 10,
+      "imports": ["basic_server.server_svc"]
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+service node1_a {
+    var x = 0;
+    pub def inc_x = action { x = x + 1; };
+    pub def get_x = x;
+}
+
+service node1_b {
+    var y = 100;
+    pub def dec_y = action { y = y - 1; };
+    pub def get_y = y;
+}
+
+@test(node1_a) {
+    assert(x == 0);
+    do inc_x;
+    assert(x == 1);
+}
+
+@test(node1_b) {
+    assert(y == 100);
+    do dec_y;
+    assert(y == 99);
+}

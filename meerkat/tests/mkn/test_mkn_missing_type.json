@@ -1,0 +1,6 @@
+{
+  "settings": {},
+  "nodes": [
+    {"alias": "node1", "file": "test.mkt"}
+  ]
+}

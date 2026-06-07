@@ -1,0 +1,15 @@
+{
+  "settings": {
+    "startup_timeout": 1.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "slow_client",
+      "type": "client",
+      "cmd": ["python3", "-c", "import time; time.sleep(2)"],
+      "timeout": 5
+    }
+  ]
+}

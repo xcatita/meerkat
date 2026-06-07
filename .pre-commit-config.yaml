@@ -1,0 +1,67 @@
+---
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-case-conflict
+      - id: check-illegal-windows-names
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: destroyed-symlinks
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: no-commit-to-branch
+        args: [--branch=main]
+
+  - repo: https://github.com/crate-ci/typos
+    rev: 37bb98842b0d8c4ffebdb75301a13db0267cef89  # v1.47.2
+    hooks:
+      - id: typos
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e  # v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # TODO: Re-enable after existing Clippy warnings are fixed.
+      # - id: cargo-clippy
+      #   name: cargo clippy
+      #   entry: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      #   language: system
+      #   types: [rust]
+      #   pass_filenames: false
+
+      - id: cargo-check-wasm
+        name: cargo check wasm
+        entry: cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
+        language: system
+        files: ^(Cargo\.toml|Cargo\.lock|meerkat-lib/Cargo\.toml|meerkat-lib/.*\.(rs|lalrpop))$
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --locked --workspace --all-features
+        language: system
+        files: ^(Cargo\.toml|Cargo\.lock|meerkat(|-lib)/Cargo\.toml|.*\.(rs|lalrpop))$
+        pass_filenames: false

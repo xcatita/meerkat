@@ -30,6 +30,10 @@ struct Args {
     /// Port to listen on in server mode (default: 9000)
     #[arg(short = 'p', long = "port", default_value_t = 9000)]
     port: u16,
+
+    /// Bind to loopback/localhost only (force 127.0.0.1 instead of public IP)
+    #[arg(long = "local", default_value_t = false)]
+    local: bool,
 }
 
 #[tokio::main]
@@ -60,16 +64,18 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                 .map_err(|e| format!("Parse error: {}", e))?;
 
             if args.server {
-                run_server(prog, remote_url_map, args.port).await
+                run_server(prog, remote_url_map, args.port, args.local).await
             } else {
-                run_client(prog, file, remote_url_map).await
+                run_client(prog, file, remote_url_map, args.local).await
             }
         }
         None => {
             if args.server {
                 return Err("-s/--server requires a file (-f). Pass a .mkt file containing the services to host.".into());
             }
-            repl::run_repl(Manager::new(), remote_url_map).await
+            let mut manager = Manager::new();
+            manager.local = args.local;
+            repl::run_repl(manager, remote_url_map).await
         }
     }
 }
@@ -78,17 +84,14 @@ async fn run_server(
     prog: Vec<Stmt>,
     remote_url_map: std::collections::HashMap<String, String>,
     port: u16,
+    local: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let mut net = NetworkActor::new(NodeType::Regular);
     let mut manager = Manager::new();
 
-    // Start network actor as server
-    let mut net = NetworkActor::new(NodeType::Server)
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    // Listen
-    let public_ip = meerkat_lib::runtime::Manager::get_public_ip();
-    let listen_addr = Address::new(&format!("/ip4/0.0.0.0/tcp/{}", port));
+    let node_ip = manager.get_node_ip();
+    let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
+    let listen_addr = Address::new(&format!("/ip4/{}/tcp/{}", listen_ip, port));
     let reply = net
         .handle_command(NetworkCommand::Listen { addr: listen_addr })
         .await;
@@ -99,11 +102,11 @@ async fn run_server(
     };
 
     let peer_id = net.local_peer_id();
-    // Replace loopback/unspecified with actual public IP
+    // Replace loopback/unspecified with actual node IP
     let actual_addr_str = actual_addr
         .0
-        .replace("0.0.0.0", &public_ip)
-        .replace("127.0.0.1", &public_ip);
+        .replace("0.0.0.0", &node_ip)
+        .replace("127.0.0.1", &node_ip);
     let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
     println!("Server listening at: {}", full_addr);
 
@@ -270,8 +273,10 @@ async fn run_client(
     prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
+    local: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut manager = Manager::new();
+    manager.local = local;
 
     // Start network if we have remote imports
     let mut net: Option<NetworkActor> = None;
@@ -280,17 +285,18 @@ async fn run_client(
         let mut n = NetworkActor::new(NodeType::Server)
             .await
             .map_err(|e| format!("Network error: {}", e))?;
-        let listen_addr = Address::new("/ip4/0.0.0.0/tcp/0");
+        let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
+        let listen_addr = Address::new(&format!("/ip4/{}/tcp/0", listen_ip));
         let reply = n
             .handle_command(NetworkCommand::Listen { addr: listen_addr })
             .await;
         if let meerkat_lib::net::NetworkReply::ListenSuccess { addr } = reply {
-            let public_ip = meerkat_lib::runtime::Manager::get_public_ip();
+            let node_ip = manager.get_node_ip();
             let peer_id = n.local_peer_id();
             let addr_str = addr
                 .0
-                .replace("0.0.0.0", &public_ip)
-                .replace("127.0.0.1", &public_ip);
+                .replace("0.0.0.0", &node_ip)
+                .replace("127.0.0.1", &node_ip);
             local_full_addr = Some(format!("{}/p2p/{}", addr_str, peer_id));
         }
         net = Some(n);

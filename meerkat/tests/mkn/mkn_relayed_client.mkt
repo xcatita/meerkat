@@ -1,0 +1,6 @@
+import relay_svc
+
+service client_svc {
+    var y = 100;
+    pub def get_y = y;
+}

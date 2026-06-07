@@ -1,0 +1,28 @@
+{
+  "settings": {
+    "startup_timeout": 10.0,
+    "monitor_poll_interval": 0.25,
+    "terminate_timeout": 5.0
+  },
+  "nodes": [
+    {
+      "alias": "node1",
+      "type": "server",
+      "file": "meerkat/tests/net_orch1.mkt",
+      "port": 9001
+    },
+    {
+      "alias": "node2",
+      "type": "server",
+      "file": "meerkat/tests/net_orch2.mkt",
+      "port": 9002,
+      "imports": ["node1.node1_a", "node1.node1_b"]
+    },
+    {
+      "alias": "node3",
+      "type": "client",
+      "file": "meerkat/tests/net_orch3.mkt",
+      "imports": ["node2.node2"]
+    }
+  ]
+}

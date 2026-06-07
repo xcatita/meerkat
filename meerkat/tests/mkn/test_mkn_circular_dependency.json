@@ -1,0 +1,7 @@
+{
+  "settings": {},
+  "nodes": [
+    {"alias": "node1", "type": "server", "file": "test1.mkt", "imports": ["node2.svc"]},
+    {"alias": "node2", "type": "server", "file": "test2.mkt", "imports": ["node1.svc"]}
+  ]
+}

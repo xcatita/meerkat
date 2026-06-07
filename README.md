@@ -1,5 +1,8 @@
 # meerkat
 
+[![CI](https://github.com/meerkat-lang/meerkat/actions/workflows/ci.yml/badge.svg)](https://github.com/meerkat-lang/meerkat/actions/workflows/ci.yml)
+[![Weekly Security](https://github.com/meerkat-lang/meerkat/actions/workflows/weekly-security.yml/badge.svg)](https://github.com/meerkat-lang/meerkat/actions/workflows/weekly-security.yml)
+
 The implementation of the Meerkat language
 
 ## Repository Structure
@@ -13,6 +16,12 @@ Core libraries for the Meerkat runtime:
 - **net** - Network layer with libp2p and circuit relay support for peer-to-peer communication
 
 ### Building and Testing
+
+We use [`pre-commit`](https://pre-commit.com/) to ensure code quality.
+
+1. **Install pre-commit:** Run `sudo apt install pre-commit` or `pip install pre-commit` or `brew install pre-commit` (see [installation guide](https://pre-commit.com/#install)).
+2. **Set up hooks:** Run `pre-commit install` in the repository root before submitting a pull request.
+
 ```bash
 # Build all packages
 cargo build
@@ -21,7 +30,7 @@ cargo build
 cargo test
 
 # Test WASM compatibility
-cargo build -p meerkat-net --target wasm32-unknown-unknown
+cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features
 
 # Run the REPL
 cargo run

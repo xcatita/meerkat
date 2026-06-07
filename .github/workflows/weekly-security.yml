@@ -1,0 +1,133 @@
+---
+name: Weekly Security
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write  # upload SARIF results
+    steps:
+      # Monitors outbound network calls and can enforce egress policy. Audit mode
+      # records unexpected traffic without blocking while CI hardening is tuned.
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
+        with:
+          languages: rust
+          queries: security-and-quality
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
+        with:
+          category: /language:rust
+
+  osv-scanner:
+    name: OSV Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write  # upload SARIF results
+    steps:
+      # Monitors outbound network calls and can enforce egress policy. Audit mode
+      # records unexpected traffic without blocking while CI hardening is tuned.
+      - name: Harden runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Run OSV scanner
+        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2  # v2.3.8
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --output=results.json
+            --format=json
+            -r
+            ./
+
+      - name: Generate OSV SARIF
+        uses: google/osv-scanner-action/osv-reporter-action@9a498708959aeaef5ef730655706c5a1df1edbc2  # v2.3.8
+        with:
+          scan-args: |-
+            --output=results.sarif
+            --new=results.json
+            --gh-annotations=false
+            --fail-on-vuln=true
+
+      - name: Upload OSV SARIF artifact
+        id: upload_artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: osv-sarif
+          path: results.sarif
+          retention-days: 90
+
+      - name: Upload OSV results artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: osv-results
+          path: results.json
+          retention-days: 90
+
+      - name: Upload OSV SARIF to code scanning
+        if: ${{ !cancelled() }}
+        uses: github/codeql-action/upload-sarif@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
+        with:
+          sarif_file: results.sarif
+          category: osv-scanner
+
+      - name: Print Code Scanning URL
+        if: ${{ !cancelled() }}
+        env:
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          echo "View the OSV Scanner results in the Security tab:"
+          echo "${SERVER_URL}/${REPOSITORY}/security/code-scanning?query=is%3Aopen+branch%3A${GITHUB_REF_NAME}+tool%3Aosv-scanner"
+
+      - name: Error troubleshooter
+        if: ${{ always() && steps.upload_artifact.outcome == 'failure' }}
+        run: |
+          echo "::error::Artifact upload failed. This is most likely caused by an error during scanning earlier in the workflow."
+          exit 1

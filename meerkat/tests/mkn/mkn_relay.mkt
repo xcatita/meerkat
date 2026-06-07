@@ -1,0 +1,4 @@
+service relay_svc {
+    var val = 42;
+    pub def get_val = val;
+}
