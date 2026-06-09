@@ -88,6 +88,7 @@ async fn run_server(
 ) -> Result<(), Box<dyn Error>> {
     let mut net = NetworkActor::new(NodeType::Server).await?;
     let mut manager = Manager::new();
+    manager.local = local;
 
     let node_ip = manager.get_node_ip();
     let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
