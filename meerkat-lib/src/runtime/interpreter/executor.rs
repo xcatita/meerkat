@@ -96,7 +96,9 @@ pub async fn execute(
             .await?;
             match val {
                 Value::Bool { val: true } => Ok(ExecuteEffect::None),
-                Value::Bool { val: false } => Err(EvalError::TypeError("Assertion failed: ".to_string() + &expr.to_string())),
+                Value::Bool { val: false } => Err(EvalError::TypeError(
+                    "Assertion failed: ".to_string() + &expr.to_string(),
+                )),
                 _ => Err(EvalError::TypeError("assert expects a boolean".to_string())),
             }
         }
