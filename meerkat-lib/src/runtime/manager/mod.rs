@@ -506,23 +506,14 @@ impl Manager {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-        // The remote service's advertised URL is its ServiceId; key this
-        // transaction's read cache and lock tracking by (that id, member).
-        let remote_sid = ServiceId::new(
-            self.remote_services
-                .get(service)
-                .map(|a| a.0.clone())
-                .unwrap_or_else(|| service.to_string()),
-        );
-        let key = (remote_sid, member.to_string());
-
-        // Serve a cached read if this transaction already read this member.
-        if let Some(t) = txn.as_deref() {
-            if let Some(v) = t.read_cache.get(&key) {
-                return Ok(v.clone());
-            }
-        }
-
+        // Remote reads are always served by the owning node, which holds this
+        // transaction's buffered writes and read locks. We deliberately do not
+        // cache the result on the requesting side: a def's value can change
+        // later in the same transaction when a composed action writes one of
+        // its dependencies on the owner, so a cached copy would go stale and
+        // the def would "stop updating". Re-fetching keeps reads consistent
+        // with the owner's buffered state. (Caching provably-immutable reads to
+        // save round-trips could be a later optimization.)
         let addr = self.remote_addr(service)?;
         let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let reply_to = self.local_reply_addr().await;
@@ -561,9 +552,6 @@ impl Manager {
             MeerkatMessage::LookupResponse { value, .. } => {
                 let val: Value = serde_json::from_str(&value)
                     .map_err(|e| EvalError::NetworkError(e.to_string()))?;
-                if let Some(t) = txn.as_deref_mut() {
-                    t.read_cache.insert(key, val.clone());
-                }
                 Ok(val)
             }
             MeerkatMessage::LookupError { error, .. } => Err(EvalError::LookupError(error)),
