@@ -714,10 +714,9 @@ impl Manager {
                     "transaction died contending for write lock on '{}'",
                     var
                 ))),
-                crate::runtime::txn::WaitDie::Wait => Err(EvalError::LockConflict(format!(
-                    "Variable '{}' is already locked; cannot acquire write lock",
-                    var
-                ))),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
+                }
             }
         }
     }
@@ -745,10 +744,9 @@ impl Manager {
                     "transaction died contending for read lock on '{}'",
                     var
                 ))),
-                crate::runtime::txn::WaitDie::Wait => Err(EvalError::LockConflict(format!(
-                    "Variable '{}' is write-locked by another transaction",
-                    var
-                ))),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
+                }
             }
         }
     }
@@ -776,10 +774,9 @@ impl Manager {
                     "transaction died contending to upgrade lock on '{}'",
                     var
                 ))),
-                crate::runtime::txn::WaitDie::Wait => Err(EvalError::LockConflict(format!(
-                    "Variable '{}' cannot be upgraded to a write lock; held by another transaction",
-                    var
-                ))),
+                crate::runtime::txn::WaitDie::Wait => {
+                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
+                }
             }
         }
     }
@@ -1552,8 +1549,8 @@ mod tests {
     }
 
     // Wait-die: an older transaction contending for a lock held by a younger
-    // transaction takes the wait path, which in stage 1 surfaces as a lock
-    // conflict (true blocking is stage 2), not a die/abort.
+    // transaction takes the wait path, surfaced as WaitOn carrying the
+    // contended (service, var) so the owner can park the request.
     #[tokio::test]
     async fn test_wait_die_older_takes_wait_path() {
         let mut manager = Manager::new();
@@ -1588,7 +1585,7 @@ mod tests {
             iteration: 0,
         };
         let result = manager.acquire_write_lock("s1", "x", &older);
-        assert!(matches!(result, Err(EvalError::LockConflict(_))));
+        assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
     }
 
     // Wait-die end to end: an action whose variable is held by an older

@@ -13,6 +13,10 @@ pub enum EvalError {
     /// A transaction lost a wait-die contest (an older transaction holds the
     /// lock) and must abort and retry with a higher iteration.
     WaitDieAbort(String),
+    /// Wait-die wait: the requester is older than the current holder and should
+    /// wait for the lock to free. Carries the contended (service, var) so the
+    /// owner can park the request on that variable's wait queue.
+    WaitOn(String, String),
 }
 
 impl std::fmt::Display for EvalError {
@@ -24,6 +28,7 @@ impl std::fmt::Display for EvalError {
             EvalError::NotImplemented => write!(f, "Not yet implemented"),
             EvalError::LockConflict(s) => write!(f, "Lock conflict: {}", s),
             EvalError::WaitDieAbort(s) => write!(f, "Wait-die abort: {}", s),
+            EvalError::WaitOn(service, var) => write!(f, "Wait-die wait on {}::{}", service, var),
         }
     }
 }
