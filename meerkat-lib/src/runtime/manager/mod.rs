@@ -578,6 +578,12 @@ impl Manager {
                 Ok(v)
             }
             Err(e) => {
+                // Wait-die wait: preserve the transaction so the parked read can
+                // resume on release; any other failure releases and drops it.
+                if matches!(e, EvalError::WaitOn(_, _)) {
+                    self.pending_txns.insert(tid, txn);
+                    return Err(e);
+                }
                 // Could not acquire the read lock (e.g. conflict): release any
                 // locks taken and do not keep this transaction prepared.
                 self.release_locks(&txn.locked, &txn.id);
@@ -946,7 +952,17 @@ impl Manager {
             }
         }
         if let Some(e) = exec_error {
-            // Execution failed: release all locks held by this (possibly merged)
+            // Wait-die wait: this transaction is older than a current holder and
+            // must wait for the contended variable to free. Preserve its partial
+            // locks and buffered writes in pending_txns so that a re-dispatch on
+            // release skips the locks it already holds (guarded by txn.locked)
+            // and resumes at the contended variable. The owner parks the
+            // request; nothing is released here.
+            if matches!(e, EvalError::WaitOn(_, _)) {
+                self.pending_txns.insert(tid, txn);
+                return Err(e);
+            }
+            // Any other failure: release all locks held by this (possibly merged)
             // transaction; do not keep it prepared. The originator's abort for
             // this tid will then be a safe no-op here.
             self.release_locks(&txn.locked, &txn.id);
@@ -1640,6 +1656,92 @@ mod tests {
                 .unwrap()
                 .vars
                 .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+    }
+
+    // Wait-die: a participant action that conflicts mid-execution parks by
+    // preserving its partial transaction (locks already taken stay held) in
+    // pending_txns, so a later re-dispatch can resume rather than restart.
+    #[tokio::test]
+    async fn test_wait_die_participant_preserves_partial_txn() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![
+                    Decl::VarDecl {
+                        name: "y".to_string(),
+                        val: Expr::Literal {
+                            val: Value::Number { val: 0 },
+                        },
+                    },
+                    Decl::VarDecl {
+                        name: "x".to_string(),
+                        val: Expr::Literal {
+                            val: Value::Number { val: 0 },
+                        },
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        // A younger transaction holds a write lock on x.
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
+        // Older transaction: write y (acquires y), then touch x (conflict, waits).
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let stmts = vec![
+            ActionStmt::Assign {
+                var: "y".to_string(),
+                expr: Expr::Literal {
+                    val: Value::Number { val: 5 },
+                },
+            },
+            ActionStmt::Assign {
+                var: "x".to_string(),
+                expr: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable {
+                        ident: "x".to_string(),
+                    }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    }),
+                },
+            },
+        ];
+        let result = manager
+            .execute_action_participant("s1", &stmts, &[], older.clone())
+            .await;
+        // Parked: returns WaitOn, and the partial transaction is preserved.
+        assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
+        assert!(manager.pending_txns.contains_key(&older));
+        // The lock it already took on y is still held (not released on park).
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("y")
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
