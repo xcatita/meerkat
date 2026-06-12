@@ -81,9 +81,7 @@ impl kameo::prelude::Message<Msg> for TableActor {
 
                 Msg::Unit
             }
-
-            #[allow(unreachable_patterns)]
-            _ => panic!("VarActor should not receive message {:?}", msg),
+            _ => panic!("TableActor should not receive message {:?}", msg),
         }
     }
 }

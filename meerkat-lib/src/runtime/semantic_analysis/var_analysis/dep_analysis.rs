@@ -1,11 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    vec,
-};
-
-use crate::ast;
-
 use super::DependAnalysis;
+use crate::ast;
+use std::collections::{HashMap, HashSet};
 
 impl DependAnalysis {
     pub fn new(decls: &Vec<ast::Decl>) -> DependAnalysis {

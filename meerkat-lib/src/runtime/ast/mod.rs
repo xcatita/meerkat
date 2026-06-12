@@ -222,10 +222,7 @@ impl Display for Value {
             Value::Bool { val } => write!(f, "{}", val),
             Value::String { val } => write!(f, "\"{}\"", val),
             Value::Closure {
-                params,
-                body,
-                env,
-                ..
+                params, body, env, ..
             } => write!(f, "fn({})[{:?}]{{{}}}", params.join(","), env, body),
             Value::ActionClosure {
                 stmts,
@@ -268,11 +265,7 @@ impl Display for Expr {
                     .join(", ")
             ),
             Expr::MemberAccess { service, member } => write!(f, "{}.{}", service, member),
-            Expr::Select {
-                table_name,
-                column_names,
-                where_clause,
-            } => write!(f, "{}", where_clause),
+            Expr::Select { where_clause, .. } => write!(f, "{}", where_clause),
             Expr::Table { records, .. } => {
                 write!(f, "[",)?;
                 for (i, record) in records.iter().enumerate() {
@@ -330,7 +323,7 @@ impl Display for Decl {
                     write!(f, "def {} = {}", name, val)
                 }
             }
-            Decl::TableDecl { name, fields } => {
+            Decl::TableDecl { name, .. } => {
                 write!(f, "table {} created", name)
             }
         }

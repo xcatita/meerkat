@@ -26,7 +26,7 @@ impl Expr {
                     item.alpha_rename(var_binded, renames);
                 }
             }
-            Expr::Unop { expr, ..} => {
+            Expr::Unop { expr, .. } => {
                 expr.alpha_rename(var_binded, renames);
             }
             Expr::Binop { expr1, expr2, .. } => {
@@ -70,10 +70,9 @@ impl Expr {
                 }
             }
             Expr::Fold {
-                table_name,
-                column_name,
                 operation,
                 identity,
+                ..
             } => {
                 operation.alpha_rename(var_binded, renames);
                 identity.alpha_rename(var_binded, renames);

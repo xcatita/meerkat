@@ -10,7 +10,7 @@
 #![allow(clippy::upper_case_acronyms)]
 use enum_as_inner::EnumAsInner;
 use logos::{Lexer, Logos, Skip};
-use std::{fmt};
+use std::fmt;
 use strum_macros::AsRefStr;
 
 fn from_num<'b>(lex: &mut Lexer<'b, Token<'b>>) -> Result<i32, String> {
