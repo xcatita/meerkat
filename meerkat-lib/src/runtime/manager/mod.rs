@@ -18,6 +18,39 @@ pub struct Service {
     pub dep: DependAnalysis,         // dependency graph + topo order
 }
 
+/// A remote request parked on a variable's wait queue because the requesting
+/// transaction is older than the current lock holder (wait-die wait). It holds
+/// everything needed to re-dispatch the request and send its deferred reply
+/// once the contended lock frees.
+pub enum ParkedRequest {
+    Action {
+        request_id: u64,
+        reply_to: String,
+        service: String,
+        stmts: Vec<ActionStmt>,
+        env: Vec<(String, Value)>,
+        tid: TxnId,
+    },
+    Lookup {
+        request_id: u64,
+        reply_to: String,
+        service: String,
+        member: String,
+        tid: TxnId,
+    },
+}
+
+impl ParkedRequest {
+    /// The transaction this parked request belongs to. Its age decides serve
+    /// order, and identifies it for purging when that transaction aborts.
+    pub fn tid(&self) -> &TxnId {
+        match self {
+            ParkedRequest::Action { tid, .. } => tid,
+            ParkedRequest::Lookup { tid, .. } => tid,
+        }
+    }
+}
+
 pub struct Manager {
     pub services: HashMap<String, Service>,
     /// Maps service name to remote address (for distributed services)
@@ -33,6 +66,10 @@ pub struct Manager {
     /// by a remote originator, executed under a shared id and held (locks +
     /// buffered writes) until a Commit or Abort arrives.
     pub pending_txns: HashMap<TxnId, Transaction>,
+    /// Requests parked because the requesting transaction is older than a lock
+    /// holder (wait-die wait), keyed by the contended (service, var). Drained
+    /// oldest-first when that variable's lock frees on commit or abort.
+    pub wait_queue: HashMap<(ServiceId, String), Vec<ParkedRequest>>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -51,9 +88,63 @@ impl Manager {
             pending_replies: HashMap::new(),
             node_id: Self::random_node_id(),
             pending_txns: HashMap::new(),
+            wait_queue: HashMap::new(),
             local_address: None,
             local: false,
         }
+    }
+
+    /// Park a request on the wait queue for the contended (service, var). It
+    /// receives no reply until that variable's lock frees and it is re-dispatched.
+    pub fn park_request(&mut self, service: &str, var: String, parked: ParkedRequest) {
+        let key = (self.id_for_service(service), var);
+        self.wait_queue.entry(key).or_default().push(parked);
+    }
+
+    /// After a holder releases locks on commit or abort, return the oldest
+    /// parked request waiting on each freed (service, var), removing it from the
+    /// queue. Serving the oldest first is what keeps an older transaction from
+    /// being starved by a stream of younger requests.
+    pub fn take_ready_waiters(
+        &mut self,
+        freed: &HashSet<(ServiceId, String)>,
+    ) -> Vec<ParkedRequest> {
+        let mut ready = Vec::new();
+        for key in freed {
+            if let Some(waiters) = self.wait_queue.get_mut(key) {
+                if let Some(idx) = waiters
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.tid().cmp(b.tid()))
+                    .map(|(i, _)| i)
+                {
+                    ready.push(waiters.remove(idx));
+                    if waiters.is_empty() {
+                        self.wait_queue.remove(key);
+                    }
+                }
+            }
+        }
+        ready
+    }
+
+    /// Remove and return all parked requests belonging to a transaction, used
+    /// when it aborts so its waiters do not later wake and prepare locks for a
+    /// transaction the originator has abandoned.
+    pub fn purge_parked_txn(&mut self, tid: &TxnId) -> Vec<ParkedRequest> {
+        let mut removed = Vec::new();
+        for waiters in self.wait_queue.values_mut() {
+            let mut i = 0;
+            while i < waiters.len() {
+                if waiters[i].tid() == tid {
+                    removed.push(waiters.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        self.wait_queue.retain(|_, v| !v.is_empty());
+        removed
     }
 
     /// Record this node's canonical address once the network is listening, so
@@ -1746,5 +1837,54 @@ mod tests {
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
+    }
+
+    // Wait-die: parked requests on a variable are served oldest-first when the
+    // lock frees, and a transaction's waiters are purged when it aborts.
+    #[tokio::test]
+    async fn test_wait_queue_oldest_first_and_purge() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+        let make = |rid: u64, tid: crate::runtime::txn::TxnId| ParkedRequest::Action {
+            request_id: rid,
+            reply_to: String::new(),
+            service: "s1".to_string(),
+            stmts: vec![],
+            env: vec![],
+            tid,
+        };
+        let old = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let mid = crate::runtime::txn::TxnId {
+            timestamp: 5,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager.park_request("s1", "x".to_string(), make(1, mid.clone()));
+        manager.park_request("s1", "x".to_string(), make(2, old.clone()));
+        // Freeing x yields the oldest waiter first; the other stays parked.
+        let mut freed = std::collections::HashSet::new();
+        freed.insert((manager.id_for_service("s1"), "x".to_string()));
+        let ready = manager.take_ready_waiters(&freed);
+        assert_eq!(ready.len(), 1);
+        assert!(ready[0].tid() == &old);
+        // The remaining (mid) waiter is purged when its transaction aborts.
+        let removed = manager.purge_parked_txn(&mid);
+        assert_eq!(removed.len(), 1);
+        assert!(manager.wait_queue.is_empty());
     }
 }
