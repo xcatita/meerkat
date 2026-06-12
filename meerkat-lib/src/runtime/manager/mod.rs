@@ -1895,4 +1895,127 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert!(manager.wait_queue.is_empty());
     }
+
+    // Wait-die end to end (single node, no network): an older transaction parks
+    // on a variable held by a younger one; when the younger aborts and frees the
+    // lock, the parked request is taken oldest-first and its re-run resumes from
+    // the preserved transaction and now succeeds.
+    #[tokio::test]
+    async fn test_wait_die_parked_request_resumes_after_release() {
+        let mut manager = Manager::new();
+        manager
+            .create_service(
+                "s1".to_string(),
+                vec![Decl::VarDecl {
+                    name: "x".to_string(),
+                    val: Expr::Literal {
+                        val: Value::Number { val: 0 },
+                    },
+                }],
+            )
+            .await
+            .unwrap();
+
+        // A younger transaction holds a write lock on x, prepared in pending_txns.
+        let younger = crate::runtime::txn::TxnId {
+            timestamp: u128::MAX,
+            node_id: 1,
+            iteration: 0,
+        };
+        manager
+            .services
+            .get_mut("s1")
+            .unwrap()
+            .vars
+            .get_mut("x")
+            .unwrap()
+            .lock = crate::runtime::txn::VarLock::WriteLocked(younger.clone());
+        let mut younger_txn = crate::runtime::txn::Transaction::new(younger.clone());
+        younger_txn
+            .locked
+            .insert((manager.id_for_service("s1"), "x".to_string()));
+        manager.pending_txns.insert(younger.clone(), younger_txn);
+
+        // Older transaction: x = x + 1 conflicts -> WaitOn -> park it.
+        let older = crate::runtime::txn::TxnId {
+            timestamp: 1,
+            node_id: 1,
+            iteration: 0,
+        };
+        let stmts = vec![ActionStmt::Assign {
+            var: "x".to_string(),
+            expr: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::Variable {
+                    ident: "x".to_string(),
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 1 },
+                }),
+            },
+        }];
+        let r1 = manager
+            .execute_action_participant("s1", &stmts, &[], older.clone())
+            .await;
+        assert!(matches!(r1, Err(EvalError::WaitOn(_, _))));
+        manager.park_request(
+            "s1",
+            "x".to_string(),
+            ParkedRequest::Action {
+                request_id: 1,
+                reply_to: String::new(),
+                service: "s1".to_string(),
+                stmts: stmts.clone(),
+                env: vec![],
+                tid: older.clone(),
+            },
+        );
+
+        // The younger holder aborts, freeing x.
+        let freed = manager.abort_participant(&younger).await;
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::Unlocked
+        ));
+
+        // Wake: take the oldest waiter and re-run it; it should now succeed.
+        let ready = manager.take_ready_waiters(&freed);
+        assert_eq!(ready.len(), 1);
+        if let ParkedRequest::Action {
+            service,
+            stmts,
+            env,
+            tid,
+            ..
+        } = &ready[0]
+        {
+            let r2 = manager
+                .execute_action_participant(service, stmts, env, tid.clone())
+                .await;
+            assert!(r2.is_ok());
+        } else {
+            panic!("expected an Action waiter");
+        }
+
+        // The older transaction now holds x's write lock and is prepared.
+        assert!(matches!(
+            manager
+                .services
+                .get("s1")
+                .unwrap()
+                .vars
+                .get("x")
+                .unwrap()
+                .lock,
+            crate::runtime::txn::VarLock::WriteLocked(_)
+        ));
+        assert!(manager.pending_txns.contains_key(&older));
+    }
 }
