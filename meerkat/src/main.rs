@@ -291,7 +291,22 @@ async fn run_server(
 
     println!("Server running, press Ctrl+C to stop...");
 
+    let mut last_keepalive = tokio::time::Instant::now();
     loop {
+        // Periodically reassure parked waiters (wait-die wait) that they are
+        // still queued, so their reply timeout never fires while we hold them.
+        if last_keepalive.elapsed() >= std::time::Duration::from_secs(5) {
+            for (request_id, reply_to) in manager.parked_keepalive_targets() {
+                if let Some(net) = manager.network.as_mut() {
+                    net.handle_command(NetworkCommand::SendMessage {
+                        addr: Address::new(&reply_to),
+                        msg: MeerkatMessage::WaitParked { request_id },
+                    })
+                    .await;
+                }
+            }
+            last_keepalive = tokio::time::Instant::now();
+        }
         let event = manager.network.as_mut().and_then(|n| n.try_recv_event());
         if let Some(event) = event {
             match event {

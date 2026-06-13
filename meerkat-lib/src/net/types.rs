@@ -125,6 +125,11 @@ pub enum MeerkatMessage {
 
     /// Acknowledgement that an Abort was processed on a participant.
     AbortResponse { request_id: u64 },
+
+    /// Sent by an owner when it parks a transactional request on a wait queue
+    /// (wait-die wait): tells the waiting originator the request is alive and
+    /// still queued, so it keeps waiting instead of timing out.
+    WaitParked { request_id: u64 },
 }
 
 /// Errors that can occur when sending
