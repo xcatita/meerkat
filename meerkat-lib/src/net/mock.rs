@@ -15,6 +15,12 @@ pub struct MockNetwork {
     pub event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
 }
 
+impl Default for MockNetwork {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockNetwork {
     /// Create a standalone mock node with its own registry
     pub fn new() -> Self {

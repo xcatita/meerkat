@@ -206,7 +206,7 @@ impl Manager {
         if let Some(service) = self.services.get(service_name) {
             if let Some(var_state) = service.vars.get(ident) {
                 let value = var_state.value.clone();
-                if let Some(t) = txn.as_deref_mut() {
+                if let Some(t) = txn {
                     t.read_cache.insert(key, value.clone());
                 }
                 return Ok(value);
@@ -223,7 +223,7 @@ impl Manager {
         service_name: &str,
         var: &str,
         value: Value,
-        mut txn: Option<&mut Transaction>,
+        txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         // Inside a transaction: acquire the write lock lazily (upgrading from a
         // read lock for read-then-write patterns like x = x + 1) and buffer the
@@ -248,7 +248,7 @@ impl Manager {
                 LockAction::Upgrade => self.upgrade_to_write_lock(service_name, var, &txn_id)?,
                 LockAction::Acquire => self.acquire_write_lock(service_name, var, &txn_id)?,
             }
-            if let Some(t) = txn.as_deref_mut() {
+            if let Some(t) = txn {
                 t.locked.insert(key.clone());
                 t.written.insert(key.clone(), value.clone());
                 // Reads later in the same transaction see the buffered write
@@ -354,11 +354,8 @@ impl Manager {
     /// Drain all pending network events and dispatch each to the matching
     /// oneshot channel in pending_replies. Non-matching events are dropped.
     pub fn dispatch_network_events(&mut self) {
-        loop {
-            let event = match self.network.as_mut() {
-                Some(n) => n.try_recv_event(),
-                None => break,
-            };
+        while let Some(n) = self.network.as_mut() {
+            let event = n.try_recv_event();
             match event {
                 Some(NetworkEvent::MessageReceived { msg, .. }) => {
                     let rid = match &msg {
@@ -501,7 +498,7 @@ impl Manager {
         &mut self,
         service: &str,
         member: &str,
-        mut txn: Option<&mut Transaction>,
+        txn: Option<&mut Transaction>,
     ) -> Result<Value, EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -523,7 +520,7 @@ impl Manager {
         // under the shared id. Pre-register it as a participant so commit/abort
         // releases that lock even if the reply is lost.
         if shared_tid.is_some() {
-            if let Some(t) = txn.as_deref_mut() {
+            if let Some(t) = txn {
                 t.participants.insert(addr.clone());
             }
         }
@@ -594,7 +591,7 @@ impl Manager {
         service_id: &ServiceId,
         stmts: Vec<ActionStmt>,
         env: Vec<(String, Value)>,
-        mut txn: Option<&mut Transaction>,
+        txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -617,7 +614,7 @@ impl Manager {
         // reaches this node to release them. If the remote never received the
         // request, the Abort it gets is a harmless no-op.
         if shared_tid.is_some() {
-            if let Some(t) = txn.as_deref_mut() {
+            if let Some(t) = txn {
                 t.participants.insert(addr.clone());
             }
         }

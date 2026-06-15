@@ -2,8 +2,8 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use meerkat_lib::runtime::ast::{Expr, Stmt, Value};
 use meerkat_lib::runtime::interpreter::{eval, execute, EvalContext, ExecuteEffect};
-use meerkat_lib::runtime::parser::parser::{parse_file, parse_repl};
 use meerkat_lib::runtime::parser::ReplParseResult;
+use meerkat_lib::runtime::parser::{parse_file, parse_repl};
 use meerkat_lib::runtime::Manager;
 
 const PROMPT: &str = "meerkat> ";
@@ -17,11 +17,7 @@ struct Watch {
 }
 
 /// Re-evaluate all watches and print any that have changed.
-async fn check_watches(
-    watches: &mut Vec<Watch>,
-    manager: &mut Manager,
-    repl_env: &[(String, Value)],
-) {
+async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &[(String, Value)]) {
     for w in watches.iter_mut() {
         let result = eval(
             &w.expr,
@@ -35,7 +31,7 @@ async fn check_watches(
         .await;
         match result {
             Ok(new_val) => {
-                let changed = w.last.as_ref().map_or(true, |old| old != &new_val);
+                let changed = w.last.as_ref() != Some(&new_val);
                 if changed {
                     match &w.last {
                         None => println!("[watch] {} = {}", w.label, new_val),
@@ -71,7 +67,7 @@ pub async fn run_repl(
         } else {
             "0.0.0.0"
         };
-        let listen_addr = meerkat_lib::net::Address::new(&format!("/ip4/{}/tcp/0", listen_ip));
+        let listen_addr = meerkat_lib::net::Address::new(format!("/ip4/{}/tcp/0", listen_ip));
         n.handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
             .await;
         manager.network = Some(n);

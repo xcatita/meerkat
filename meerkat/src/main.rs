@@ -57,14 +57,14 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
     let mut remote_url_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for url in &args.import_urls {
-        if let Some(slug) = url.split('/').last() {
+        if let Some(slug) = url.split('/').next_back() {
             remote_url_map.insert(slug.to_string(), url.clone());
         }
     }
 
     match args.input_file {
         Some(ref file) => {
-            let prog = meerkat_lib::runtime::parser::parser::parse_file(file)
+            let prog = meerkat_lib::runtime::parser::parse_file(file)
                 .map_err(|e| format!("Parse error: {}", e))?;
 
             if args.check_only {
@@ -101,7 +101,7 @@ async fn run_server(
 
     let node_ip = manager.get_node_ip();
     let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
-    let listen_addr = Address::new(&format!("/ip4/{}/tcp/{}", listen_ip, port));
+    let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, port));
     let reply = net
         .handle_command(NetworkCommand::Listen { addr: listen_addr })
         .await;
@@ -156,120 +156,111 @@ async fn run_server(
     println!("Server running, press Ctrl+C to stop...");
 
     loop {
-        let event = manager.network.as_mut().and_then(|n| n.try_recv_event());
-        if let Some(event) = event {
-            match event {
-                NetworkEvent::MessageReceived { peer: _, msg } => {
-                    match msg {
-                        MeerkatMessage::LookupRequest {
-                            request_id,
-                            service,
-                            member,
-                            reply_to,
-                            txn_id,
-                        } => {
-                            // Transactional read: acquire and hold a read lock
-                            // under the shared id. Plain read otherwise.
-                            let result = match txn_id {
-                                Some(tid) => {
-                                    manager
-                                        .remote_read_participant(&service, &member, tid)
-                                        .await
-                                }
-                                None => manager.lookup(&member, &service, None).await,
-                            };
-                            let response = match result {
-                                Ok(val) => MeerkatMessage::LookupResponse {
-                                    request_id,
-                                    value: serde_json::to_string(&val).unwrap_or_default(),
-                                },
-                                Err(e) => MeerkatMessage::LookupError {
-                                    request_id,
-                                    error: e.to_string(),
-                                },
-                            };
-                            if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
-                            }
+        if let Some(NetworkEvent::MessageReceived { peer: _, msg }) =
+            manager.network.as_mut().and_then(|n| n.try_recv_event())
+        {
+            match msg {
+                MeerkatMessage::LookupRequest {
+                    request_id,
+                    service,
+                    member,
+                    reply_to,
+                    txn_id,
+                } => {
+                    // Transactional read: acquire and hold a read lock
+                    // under the shared id. Plain read otherwise.
+                    let result = match txn_id {
+                        Some(tid) => {
+                            manager
+                                .remote_read_participant(&service, &member, tid)
+                                .await
                         }
-                        MeerkatMessage::ActionRequest {
+                        None => manager.lookup(&member, &service, None).await,
+                    };
+                    let response = match result {
+                        Ok(val) => MeerkatMessage::LookupResponse {
                             request_id,
-                            service,
-                            stmts,
-                            env: action_env,
-                            reply_to,
-                            txn_id,
-                        } => {
-                            // Part of a distributed transaction: execute under the
-                            // shared id and hold. Standalone: commit immediately.
-                            let result = match txn_id {
-                                Some(tid) => {
-                                    manager
-                                        .execute_action_participant(
-                                            &service,
-                                            &stmts,
-                                            &action_env,
-                                            tid,
-                                        )
-                                        .await
-                                }
-                                None => {
-                                    manager
-                                        .execute_action_with_env(&service, &stmts, &action_env)
-                                        .await
-                                }
-                            };
-                            let response = MeerkatMessage::ActionResponse {
-                                request_id,
-                                success: result.is_ok(),
-                                error: result.err().map(|e| e.to_string()),
-                            };
-                            if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
-                            }
-                        }
-                        MeerkatMessage::Commit {
+                            value: serde_json::to_string(&val).unwrap_or_default(),
+                        },
+                        Err(e) => MeerkatMessage::LookupError {
                             request_id,
-                            txn_id,
-                            reply_to,
-                        } => {
-                            let result = manager.commit_participant(&txn_id).await;
-                            let response = MeerkatMessage::CommitResponse {
-                                request_id,
-                                success: result.is_ok(),
-                                error: result.err().map(|e| e.to_string()),
-                            };
-                            if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: response,
-                                })
-                                .await;
-                            }
+                            error: e.to_string(),
+                        },
+                    };
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: response,
+                        })
+                        .await;
+                    }
+                }
+                MeerkatMessage::ActionRequest {
+                    request_id,
+                    service,
+                    stmts,
+                    env: action_env,
+                    reply_to,
+                    txn_id,
+                } => {
+                    // Part of a distributed transaction: execute under the
+                    // shared id and hold. Standalone: commit immediately.
+                    let result = match txn_id {
+                        Some(tid) => {
+                            manager
+                                .execute_action_participant(&service, &stmts, &action_env, tid)
+                                .await
                         }
-                        MeerkatMessage::Abort {
-                            request_id,
-                            txn_id,
-                            reply_to,
-                        } => {
-                            manager.abort_participant(&txn_id).await;
-                            if let Some(net) = manager.network.as_mut() {
-                                net.handle_command(NetworkCommand::SendMessage {
-                                    addr: Address::new(&reply_to),
-                                    msg: MeerkatMessage::AbortResponse { request_id },
-                                })
-                                .await;
-                            }
+                        None => {
+                            manager
+                                .execute_action_with_env(&service, &stmts, &action_env)
+                                .await
                         }
-                        _ => {}
+                    };
+                    let response = MeerkatMessage::ActionResponse {
+                        request_id,
+                        success: result.is_ok(),
+                        error: result.err().map(|e| e.to_string()),
+                    };
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: response,
+                        })
+                        .await;
+                    }
+                }
+                MeerkatMessage::Commit {
+                    request_id,
+                    txn_id,
+                    reply_to,
+                } => {
+                    let result = manager.commit_participant(&txn_id).await;
+                    let response = MeerkatMessage::CommitResponse {
+                        request_id,
+                        success: result.is_ok(),
+                        error: result.err().map(|e| e.to_string()),
+                    };
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: response,
+                        })
+                        .await;
+                    }
+                }
+                MeerkatMessage::Abort {
+                    request_id,
+                    txn_id,
+                    reply_to,
+                } => {
+                    manager.abort_participant(&txn_id).await;
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: MeerkatMessage::AbortResponse { request_id },
+                        })
+                        .await;
                     }
                 }
                 _ => {}
@@ -296,7 +287,7 @@ async fn run_client(
             .await
             .map_err(|e| format!("Network error: {}", e))?;
         let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
-        let listen_addr = Address::new(&format!("/ip4/{}/tcp/0", listen_ip));
+        let listen_addr = Address::new(format!("/ip4/{}/tcp/0", listen_ip));
         let reply = n
             .handle_command(NetworkCommand::Listen { addr: listen_addr })
             .await;
@@ -352,10 +343,9 @@ async fn run_client(
                         .parent()
                         .unwrap_or(std::path::Path::new("."));
                     let import_path = base_dir.join(path);
-                    let import_stmts = meerkat_lib::runtime::parser::parser::parse_file(
-                        import_path.to_str().unwrap(),
-                    )
-                    .map_err(|e| format!("Import parse error: {}", e))?;
+                    let import_stmts =
+                        meerkat_lib::runtime::parser::parse_file(import_path.to_str().unwrap())
+                            .map_err(|e| format!("Import parse error: {}", e))?;
                     for import_stmt in &import_stmts {
                         if let Stmt::Service { name, decls } = import_stmt {
                             manager

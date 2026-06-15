@@ -3,7 +3,7 @@ use crate::ast;
 use std::collections::{HashMap, HashSet};
 
 impl DependAnalysis {
-    pub fn new(decls: &Vec<ast::Decl>) -> DependAnalysis {
+    pub fn new(decls: &[ast::Decl]) -> DependAnalysis {
         let mut vars: HashSet<String> = HashSet::new();
         let mut defs: HashSet<String> = HashSet::new();
         let mut reactive_names = HashSet::new();
@@ -51,7 +51,7 @@ impl DependAnalysis {
     /// * `tables` - set of table names (no dependencies).
     /// * `visited` - set of visited nodes in dfs.
     /// * `calced` - map of def to their computed dependencies, only appeared
-    ///    when finished computing for a def.
+    ///   when finished computing for a def.
     /// # Panics
     /// * panic if a cycle is detected in the graph.
     fn dfs_helper(
@@ -84,17 +84,18 @@ impl DependAnalysis {
 
         for dep_name in graph
             .get(name)
-            .expect(&format!("No such name in dep graph: {}", name))
+            .unwrap_or_else(|| panic!("No such name in dep graph: {}", name))
         {
             Self::dfs_helper(graph, vars, tables, visited, finished, calced, dep_name);
             dep.extend(
                 calced
                     .get(dep_name)
-                    .expect(&format!(
-                        "Not finished transitive dependency 
-                        calculation of: {}",
-                        dep_name
-                    ))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "Not finished transitive dependency calculation of: {}",
+                            dep_name
+                        )
+                    })
                     .clone(),
             );
             dep.insert(dep_name.clone());
@@ -133,7 +134,7 @@ impl DependAnalysis {
                 name.clone(),
                 self.dep_transitive
                     .get(name)
-                    .expect(&format!("cannot find def {} in trans dep", name))
+                    .unwrap_or_else(|| panic!("cannot find def {} in trans dep", name))
                     .intersection(&vars_and_tables)
                     .cloned()
                     .collect(),

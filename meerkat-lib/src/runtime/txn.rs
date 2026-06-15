@@ -97,6 +97,12 @@ pub enum VarLock {
     WriteLocked(TxnId),
 }
 
+impl Default for VarLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VarLock {
     pub fn new() -> Self {
         VarLock::Unlocked

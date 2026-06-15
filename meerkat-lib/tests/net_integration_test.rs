@@ -38,12 +38,14 @@ async fn test_send_and_receive() {
         sleep(Duration::from_millis(100)).await;
         if let Ok(event) = server.event_rx.try_recv() {
             println!("Server got event: {:?}", event);
-            if let NetworkEvent::MessageReceived { msg, .. } = event {
-                if let MeerkatMessage::Ping { content } = msg {
-                    assert_eq!(content, "hello from client");
-                    received = true;
-                    break;
-                }
+            if let NetworkEvent::MessageReceived {
+                msg: MeerkatMessage::Ping { content },
+                ..
+            } = event
+            {
+                assert_eq!(content, "hello from client");
+                received = true;
+                break;
             }
         }
     }
@@ -307,11 +309,9 @@ async fn test_trait_with_real_network() {
     let mut received = false;
     for _ in 0..50 {
         sleep(Duration::from_millis(100)).await;
-        if let Some(event) = server.try_recv_event() {
-            if let NetworkEvent::MessageReceived { .. } = event {
-                received = true;
-                break;
-            }
+        if let Some(NetworkEvent::MessageReceived { .. }) = server.try_recv_event() {
+            received = true;
+            break;
         }
     }
 

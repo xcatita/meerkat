@@ -53,9 +53,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # TODO: Re-enable after existing Clippy warnings are fixed.
-      # - name: Run Clippy
-      #   run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Check WASM build
         run: cargo check --locked -p meerkat-lib --target wasm32-unknown-unknown --all-features

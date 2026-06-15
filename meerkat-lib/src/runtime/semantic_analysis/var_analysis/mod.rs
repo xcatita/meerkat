@@ -27,33 +27,33 @@ pub struct DependAnalysis {
 
 impl Display for DependAnalysis {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Dependency Graph \n")?;
+        writeln!(f, "Dependency Graph ")?;
         for (name, deps) in self.dep_graph.iter() {
             write!(f, "{} -> ", name)?;
             for dep in deps.iter() {
                 write!(f, "{},", dep)?;
             }
-            write!(f, "\n")?;
+            writeln!(f)?;
         }
-        write!(f, "Transitive Dependency (Var only) \n")?;
+        writeln!(f, "Transitive Dependency (Var only) ")?;
         for (name, deps) in self.dep_vars.iter() {
             write!(f, "{} -> ", name)?;
             for dep in deps.iter() {
                 write!(f, "{},", dep)?;
             }
-            write!(f, "\n")?;
+            writeln!(f)?;
         }
 
-        write!(f, "Topological Order \n")?;
+        writeln!(f, "Topological Order ")?;
         for name in self.topo_order.iter() {
             write!(f, "{} ", name)?;
         }
-        write!(f, "\n")?;
+        writeln!(f)?;
         Ok(())
     }
 }
 
-pub fn calc_dep_srv(decls: &Vec<ast::Decl>) -> DependAnalysis {
+pub fn calc_dep_srv(decls: &[ast::Decl]) -> DependAnalysis {
     let mut da = DependAnalysis::new(decls);
     da.calc_dep_vars();
     //println!("{}", da);
@@ -61,7 +61,7 @@ pub fn calc_dep_srv(decls: &Vec<ast::Decl>) -> DependAnalysis {
 }
 
 // enumerate services and call calc_dep_srv on each one
-pub fn calc_dep_prog(stmts: &Vec<ast::Stmt>) {
+pub fn calc_dep_prog(stmts: &[ast::Stmt]) {
     for stmt in stmts.iter() {
         match stmt {
             ast::Stmt::Service { decls, .. } | ast::Stmt::Update { decls, .. } => {

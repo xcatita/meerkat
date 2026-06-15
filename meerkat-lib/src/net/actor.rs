@@ -590,19 +590,15 @@ impl NetworkActor {
             libp2p::swarm::SwarmEvent::Behaviour(MeerkatBehaviourEvent::Relay(_event)) => {
                 //println!("Relay server event: {:?}", event);
             }
-            libp2p::swarm::SwarmEvent::Behaviour(MeerkatBehaviourEvent::Identify(event)) => {
-                if let libp2p::identify::Event::Received { info, .. } = &event {
-                    //println!("Adding external address from identify: {}", info.observed_addr);
-                    swarm.add_external_address(info.observed_addr.clone());
-                }
-                //println!("Identify event: {:?}", event);
+            libp2p::swarm::SwarmEvent::Behaviour(MeerkatBehaviourEvent::Identify(
+                libp2p::identify::Event::Received { info, .. },
+            )) => {
+                swarm.add_external_address(info.observed_addr.clone());
             }
             libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 // Check if this `OutgoingConnectionError` matches our `pending_relay` peer
                 let matches_relay = Self::get_pending_relay_peer(pending_relay)
-                    .map_or(false, |relay_peer| {
-                        peer_id.map_or(false, |failed_peer| failed_peer == relay_peer)
-                    });
+                    .is_some_and(|relay_peer| peer_id == Some(relay_peer));
 
                 // Fail the `pending_relay` reservation if it matches the dial error
                 if matches_relay {

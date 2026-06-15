@@ -16,12 +16,10 @@ use strum_macros::AsRefStr;
 fn from_num<'b>(lex: &mut Lexer<'b, Token<'b>>) -> Result<i32, String> {
     let slice = lex.slice();
 
-    let res = slice.parse();
-
-    if res.is_err() {
-        return Err(format!("Parsing failed with Error {:?}", res.unwrap_err()));
-    }
-    let out: i64 = res.unwrap();
+    let out: i64 = match slice.parse() {
+        Ok(val) => val,
+        Err(e) => return Err(format!("Parsing failed with Error {:?}", e)),
+    };
     if out > ((i32::MIN as i64).abs()) {
         // All numbers are positive because - is lexed separately
         return Err(format!("Number {} is out of bounds", out));
