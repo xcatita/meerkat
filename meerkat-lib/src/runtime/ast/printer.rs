@@ -1,42 +1,49 @@
 //! AST pretty printer inspired by Rust syntax. This module is primarily
 //! invoked by the `--ast` flag for use in testing and development. It
-//! supports configurable indentation levels.
+//! supports configurable indentation levels with `INDENTATION` constant
 
 use crate::runtime::ast::{ActionStmt, Decl, Expr, Field, Stmt, Value};
 
 const INDENTATION: usize = 2;
 
+/// Pretty printer for formatting and displaying the abstract syntax tree
 pub struct AstPrinter {
     spaces: usize,
 }
 
 impl Default for AstPrinter {
+    /// Creates a default AstPrinter with two spaces of indentation
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl AstPrinter {
+    /// Creates a new AstPrinter instance with default indentation
     pub fn new() -> Self {
         Self {
             spaces: INDENTATION,
         }
     }
 
+    /// Creates a new AstPrinter instance with custom indentation level
     pub fn with_spaces(spaces: usize) -> Self {
         Self { spaces }
     }
 
+    /// Prints spaces corresponding to the current indentation level
     fn print_indent(&self, indent: usize) {
         print!("{}", " ".repeat(indent * self.spaces));
     }
 
+    /// Prints a sequence of top-level statements representing a program
     pub fn print_program(&self, stmts: &[Stmt]) {
         for stmt in stmts {
             self.print_stmt(stmt, 0);
         }
     }
 
+    /// Prints a single top-level statement with the specified indentation
     pub fn print_stmt(&self, stmt: &Stmt, indent: usize) {
         self.print_indent(indent);
         match stmt {
@@ -75,6 +82,7 @@ impl AstPrinter {
         }
     }
 
+    /// Prints a declaration statement with the specified indentation
     pub fn print_decl(&self, decl: &Decl, indent: usize) {
         self.print_indent(indent);
         match decl {
@@ -95,6 +103,7 @@ impl AstPrinter {
         }
     }
 
+    /// Prints a record/table field description with the specified indentation
     fn print_field(&self, field: &Field, indent: usize) {
         self.print_indent(indent);
         println!(
@@ -103,6 +112,7 @@ impl AstPrinter {
         );
     }
 
+    /// Prints an action statement with the specified indentation
     pub fn print_action_stmt(&self, stmt: &ActionStmt, indent: usize) {
         self.print_indent(indent);
         match stmt {
@@ -133,6 +143,7 @@ impl AstPrinter {
         }
     }
 
+    /// Prints an expression with the specified indentation
     pub fn print_expr(&self, expr: &Expr, indent: usize) {
         self.print_indent(indent);
         match expr {
@@ -227,6 +238,7 @@ impl AstPrinter {
         }
     }
 
+    /// Prints a runtime value representation with the specified indentation
     pub fn print_value(&self, val: &Value, indent: usize) {
         self.print_indent(indent);
         match val {
