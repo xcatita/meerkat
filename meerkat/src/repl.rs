@@ -4,8 +4,10 @@ use meerkat_lib::runtime::parser::parser::{parse_file, parse_repl};
 use meerkat_lib::runtime::parser::ReplParseResult;
 use meerkat_lib::runtime::Manager;
 
+use directories::ProjectDirs;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use std::io::{self, IsTerminal};
 
 const PROMPT: &str = "meerkat> ";
 const PROMPT_CONT: &str = "       > ";
@@ -55,11 +57,26 @@ pub async fn run_repl(
     remote_url_map: std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DefaultEditor::new()?;
-    let _ = reader.load_history("meerkat_history.txt");
+    use std::path::PathBuf;
 
-    println!("Meerkat REPL  (Ctrl-D to exit)");
-    println!("Enter service definitions, @test blocks, statements, or expressions.");
-    println!();
+    let proj = ProjectDirs::from("", "", "meerkat");
+    let history_path = match proj {
+        Some(proj) => {
+            let _ = std::fs::create_dir_all(proj.data_dir());
+            proj.data_dir().join(".meerkat_history.txt")
+        }
+        None => PathBuf::from("meerkat_history.txt"),
+    };
+
+    let _ = reader.load_history(&history_path);
+
+    let is_tty = io::stdin().is_terminal();
+
+    if is_tty {
+        println!("Meerkat REPL  (Ctrl-D to exit)");
+        println!("Enter service definitions, @test blocks, statements, or expressions.");
+        println!();
+    }
 
     if !remote_url_map.is_empty() {
         let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
@@ -93,6 +110,7 @@ pub async fn run_repl(
             Ok(l) => l,
             Err(ReadlineError::Interrupted) => {
                 buffer.clear();
+                println!("Interrupt");
                 continuation = false;
                 continue;
             }
@@ -116,13 +134,17 @@ pub async fn run_repl(
                 continuation = true;
             }
             ReplParseResult::Error(msg) => {
-                reader.add_history_entry(buffer.trim_end())?;
+                if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
+                    eprintln!("Warning: failed to save history: {}", e);
+                }
                 eprintln!("Parse error: {}", msg);
                 buffer.clear();
                 continuation = false;
             }
             ReplParseResult::Complete(stmts) => {
-                reader.add_history_entry(buffer.trim_end())?;
+                if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
+                    eprintln!("Warning: failed to save history: {}", e);
+                }
                 for stmt in stmts {
                     match exec_stmt(
                         stmt,
@@ -145,7 +167,7 @@ pub async fn run_repl(
             }
         }
     }
-    if let Err(e) = reader.save_history("meerkat_history.txt") {
+    if let Err(e) = reader.save_history(&history_path) {
         eprintln!("Warning: failed to save history: {}", e);
     }
     Ok(())
