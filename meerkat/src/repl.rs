@@ -1,10 +1,13 @@
-use std::io::{self, BufRead, IsTerminal, Write};
-
 use meerkat_lib::runtime::ast::{Expr, Stmt, Value};
 use meerkat_lib::runtime::interpreter::{eval, execute, EvalContext, ExecuteEffect};
 use meerkat_lib::runtime::parser::ReplParseResult;
 use meerkat_lib::runtime::parser::{parse_file, parse_repl};
 use meerkat_lib::runtime::Manager;
+
+use directories::ProjectDirs;
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use std::io::{self, IsTerminal};
 
 const PROMPT: &str = "meerkat> ";
 const PROMPT_CONT: &str = "       > ";
@@ -49,8 +52,21 @@ pub async fn run_repl(
     mut manager: Manager,
     remote_url_map: std::collections::HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stdin = io::stdin();
-    let is_tty = stdin.is_terminal();
+    let mut reader = DefaultEditor::new()?;
+    use std::path::PathBuf;
+
+    let proj = ProjectDirs::from("", "", "meerkat");
+    let history_path = match proj {
+        Some(proj) => {
+            let _ = std::fs::create_dir_all(proj.data_dir());
+            proj.data_dir().join(".meerkat_history.txt")
+        }
+        None => PathBuf::from(".meerkat_history.txt"),
+    };
+
+    let _ = reader.load_history(&history_path);
+
+    let is_tty = io::stdin().is_terminal();
 
     if is_tty {
         println!("Meerkat REPL  (Ctrl-D to exit)");
@@ -78,22 +94,26 @@ pub async fn run_repl(
 
     let mut buffer = String::new();
     let mut continuation = false;
-    let mut lines = stdin.lock().lines();
 
     loop {
-        if is_tty {
-            if continuation {
-                print!("{}", PROMPT_CONT);
-            } else {
-                print!("{}", PROMPT);
-            }
-            io::stdout().flush()?;
-        }
+        let readline = if continuation {
+            reader.readline(PROMPT_CONT)
+        } else {
+            reader.readline(PROMPT)
+        };
 
-        let line = match lines.next() {
-            Some(Ok(l)) => l,
-            Some(Err(e)) => return Err(e.into()),
-            None => break,
+        let line = match readline {
+            Ok(l) => l,
+            Err(ReadlineError::Interrupted) => {
+                buffer.clear();
+                if is_tty {
+                    println!("Interrupt");
+                }
+                continuation = false;
+                continue;
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => return Err(e.into()),
         };
 
         buffer.push_str(&line);
@@ -112,11 +132,17 @@ pub async fn run_repl(
                 continuation = true;
             }
             ReplParseResult::Error(msg) => {
+                if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
+                    eprintln!("Warning: failed to save history: {}", e);
+                }
                 eprintln!("Parse error: {}", msg);
                 buffer.clear();
                 continuation = false;
             }
             ReplParseResult::Complete(stmts) => {
+                if let Err(e) = reader.add_history_entry(buffer.trim_end()) {
+                    eprintln!("Warning: failed to save history: {}", e);
+                }
                 for stmt in stmts {
                     match exec_stmt(
                         stmt,
@@ -139,9 +165,8 @@ pub async fn run_repl(
             }
         }
     }
-
-    if is_tty {
-        println!();
+    if let Err(e) = reader.save_history(&history_path) {
+        eprintln!("Warning: failed to save history: {}", e);
     }
     Ok(())
 }
