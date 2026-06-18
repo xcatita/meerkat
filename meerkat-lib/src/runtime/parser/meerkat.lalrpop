@@ -5,9 +5,10 @@
 // Initial grammar for L1 
 
 // Grammar 
-grammar<'input>;
+grammar<'input>(interner: &mut crate::runtime::interner::Interner);
 
 use crate::ast::{Stmt, ActionStmt, Decl, Expr, UnOp, BinOp, DataType, Field, Value};
+use crate::runtime::interner::{Interner, Symbol};
 use lalrpop_util::ParseError;
 use crate::runtime::parser::lex::Token;
 
@@ -87,10 +88,10 @@ Stmt: Stmt = {
         Stmt::Service { name: i, decls: ds }
     },
     "@test" "(" <i:Ident> ")" "{" <astmts: ActionStmts> "}" => {
-        Stmt::Test { service: i, stmts: astmts }
+        Stmt::Test { service_name: i, stmts: astmts }
     },
     "import" <i:Ident> => {
-        Stmt::Import { path: format!("{}.mkt", i), service: i }
+        Stmt::Import { path: format!("{}.mkt", interner.get(i)), service_name: i }
     },
     <a:ActionStmt> => Stmt::ActionStmt(a),
     "watch" <e:Expr> ";" => Stmt::Watch { expr: e },
@@ -109,7 +110,7 @@ ActionStmt: ActionStmt = {
     "insert"  <e: Expr> "into" <t: Ident> => {
         ActionStmt::Insert {row: e, table_name: t}
     },
-    <i:Ident> "=" <e:Expr> ";" => ActionStmt::Assign { var: i, expr: e },
+    <i:Ident> "=" <e:Expr> ";" => ActionStmt::Assign { name: i, expr: e },
     <e:Expr> ";" => ActionStmt::Expr(e),
 }
 
@@ -144,7 +145,7 @@ DataType: DataType = {
     "bool" => DataType::Bool,
 }
 
-Params: Vec<String> = {
+Params: Vec<Symbol> = {
     <mut v:(<Ident> ",")*> <e:Ident?> => 
     match e {
         None => v,
@@ -172,14 +173,14 @@ SubExpr: Expr = {
     <n:Number> => Expr::Literal { val: Value::Number { val: n } },
     <b:Bool> => Expr::Literal { val: Value::Bool { val: b } },
     <s: "strlit"> => Expr::Literal { val: Value::String { val: s.to_owned() } },
-    <i:Ident> => Expr::Variable { ident: i },
+    <i:Ident> => Expr::Variable { name: i },
     "{" <args: Args> "}" => Expr::Tuple {val: args},
     "(" <Expr> ")" => <>,
     
     <expr:SubExpr> "(" <args:Args> ")" => 
         Expr::Call { func: Box::new(expr), args },
 
-    <s:Ident> "." <m:Ident> => Expr::MemberAccess { service: s, member: m },
+    <s:Ident> "." <m:Ident> => Expr::MemberAccess { service_name: s, member_name: m },
 
     "action" "{" <stmts: ActionStmts> "}" => Expr::Action(stmts),
 }
@@ -195,7 +196,7 @@ Expr: Expr = {
     "!" <e:Expr> => {
         Expr::Unop { expr: Box::new(e), op: UnOp::Not }
     },
-    <i: Ident> ":" <e: Expr> => Expr::KeyVal {key: i, value: Box::new(e)},
+    <i: Ident> ":" <e: Expr> => Expr::KeyVal {name: i, value: Box::new(e)},
     
     
 
@@ -317,6 +318,6 @@ Number: i32 = {
     <n:"num"> => n
 }
 
-Ident: String = {
-    <i:"ident"> => i.to_owned()
+Ident: Symbol = {
+    <i:"ident"> => interner.insert(i)
 }

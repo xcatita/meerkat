@@ -1,51 +1,58 @@
-//! Transaction ID and per-variable lock state for the Manager.
+//! Transaction ID and per-variable lock state for the `Manager`
 
-use crate::net::{Address, ServiceId};
+use crate::net::{Address, ServiceNetId};
 use crate::runtime::ast::Value;
+use crate::runtime::interner::Symbol;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A globally unique transaction identifier.
+/// A globally unique transaction identifier represented by `TxnId`
 ///
-/// Per the Historiographer design a tid is a (unique node identifier,
-/// timestamp) pair. The timestamp is nanoseconds since the Unix epoch; the
-/// node_id makes ids from different nodes distinct and serves as the age
-/// tiebreaker. Serializable so it can travel in cross-node messages.
+/// Per the `Historiographer` design, a `tid` is a (unique node
+/// identifier, timestamp) pair. The timestamp is nanoseconds since
+/// the Unix epoch; the `node_id` makes IDs from different nodes
+/// distinct and serves as the age tiebreaker. Serializable so it
+/// can travel in cross-node messages
 ///
-/// Age (for future wait-die): older = smaller timestamp, with node_id as
-/// tiebreaker. Higher iteration = higher priority among retries of the same
-/// transaction.
+/// Age (for wait-die): older = smaller timestamp, with `node_id` as
+/// tiebreaker. Higher `iteration` = higher priority among retries
+/// of the same transaction
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TxnId {
-    /// Creation time as nanoseconds since the Unix epoch, used as a logical
-    /// clock: monotonically increasing per node so two transactions minted in
-    /// the same wall-clock tick still get distinct ids.
+    /// Creation time as nanoseconds since the Unix epoch, used as a
+    /// logical clock: monotonically increasing per node so two
+    /// transactions minted in the same wall-clock tick still get
+    /// distinct IDs
     pub timestamp: u128,
-    /// (Probabilistically) unique identifier of the originating node.
+    /// (Probabilistically) unique identifier of the originating node
     pub node_id: u64,
-    /// Incremented on retry so retried transactions gain priority.
+    /// Incremented on retry so retried transactions gain priority
     pub iteration: u32,
 }
 
-/// Last nanosecond timestamp handed out as a TxnId on this process. Acts as a
-/// logical clock: if the wall clock has not advanced past it, we bump by one so
-/// two transactions in the same tick still get distinct (and ordered) ids. This
-/// guarantees uniqueness on a node, which matters because TxnId aliases lock
-/// owners and keys participant-held transaction state.
+/// Last nanosecond timestamp handed out as a `TxnId` on this process
+///
+/// Acts as a logical clock: if the wall clock has not advanced past
+/// it, we bump by one so two transactions in the same tick still
+/// get distinct (and ordered) IDs
+/// This guarantees uniqueness on a node, which matters because
+/// `TxnId` aliases lock owners and keys participant-held transaction
+/// state
 static LAST_TXN_NANOS: Mutex<u128> = Mutex::new(0);
 
 impl TxnId {
-    /// Create a new, node-unique transaction id originating from the given node.
+    /// Create a new, node-unique transaction ID originating from the given node
     pub fn new(node_id: u64) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        // Claim a timestamp strictly greater than any previously issued one,
-        // even if the clock repeated or went backwards. A clock error (now == 0)
-        // can no longer cause a collision because we still take last + 1.
+        // Claim a timestamp strictly greater than any previously issued
+        // one, even if the clock repeated or went backwards. A clock
+        // error (`now == 0`) can no longer cause a collision because we
+        // still take `last + 1`
         let timestamp = {
             let mut last = LAST_TXN_NANOS.lock().unwrap_or_else(|e| e.into_inner());
             let ts = now.max(*last + 1);
@@ -59,8 +66,8 @@ impl TxnId {
         }
     }
 
-    /// Return a new TxnId with the same timestamp/node but higher iteration,
-    /// for use when retrying an aborted transaction.
+    /// Return a new `TxnId` with the same timestamp/node but higher
+    /// iteration, for use when retrying an aborted transaction
     pub fn retry(&self) -> Self {
         TxnId {
             timestamp: self.timestamp,
@@ -78,9 +85,9 @@ impl PartialOrd for TxnId {
 
 impl Ord for TxnId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Age ordering: older timestamp = smaller = higher priority, with
-        // node_id as the tiebreaker. Higher iteration = higher priority among
-        // retries of the same transaction.
+        // Age ordering: older `timestamp` = smaller = higher priority, with
+        // `node_id` as the tiebreaker. Higher `iteration` = higher priority among
+        // retries of the same transaction
         self.timestamp
             .cmp(&other.timestamp)
             .then(self.node_id.cmp(&other.node_id))
@@ -88,8 +95,9 @@ impl Ord for TxnId {
     }
 }
 
-/// Per-variable lock state used by the Manager.
-/// Multiple readers are allowed simultaneously; writers are exclusive.
+/// Per-variable lock state used by the `Manager`
+///
+/// Multiple readers are allowed simultaneously; writers are exclusive
 #[derive(Debug, Clone)]
 pub enum VarLock {
     Unlocked,
@@ -108,7 +116,7 @@ impl VarLock {
         VarLock::Unlocked
     }
 
-    /// Try to acquire a read lock. Succeeds unless write-locked.
+    /// Try to acquire a read lock, succeeding unless write-locked
     pub fn try_read(&mut self, txn_id: &TxnId) -> bool {
         match self {
             VarLock::Unlocked => {
@@ -125,18 +133,18 @@ impl VarLock {
         }
     }
 
-    /// Try to acquire an exclusive write lock. Fails if any lock is held.
+    /// Try to acquire an exclusive write lock, failing if any lock is held
     pub fn try_write(&mut self, txn_id: &TxnId) -> bool {
         match self {
             VarLock::Unlocked => {
                 *self = VarLock::WriteLocked(txn_id.clone());
                 true
             }
-            _ => false,
+            VarLock::ReadLocked(_) | VarLock::WriteLocked(_) => false,
         }
     }
 
-    /// Release a read lock held by txn_id.
+    /// Release a read lock held by `txn_id`
     pub fn release_read(&mut self, txn_id: &TxnId) {
         if let VarLock::ReadLocked(set) = self {
             set.remove(txn_id);
@@ -146,16 +154,18 @@ impl VarLock {
         }
     }
 
-    /// Release the write lock if currently held by txn_id.
+    /// Release the write lock if currently held by `txn_id`
     pub fn release_write(&mut self, txn_id: &TxnId) {
         if matches!(self, VarLock::WriteLocked(tid) if tid == txn_id) {
             *self = VarLock::Unlocked;
         }
     }
 
-    /// Upgrade a read lock held solely by txn_id to a write lock.
-    /// Needed for read-then-write patterns (e.g. x = x + 1).
-    /// Returns true if upgrade succeeded or var is already write-locked by txn_id.
+    /// Upgrade a read lock held solely by `txn_id` to a write lock
+    ///
+    /// Needed for read-then-write patterns (e.g., `x = x + 1`)
+    /// Returns `true` if upgrade succeeded or variable is already
+    /// write-locked by `txn_id`
     pub fn upgrade_to_write(&mut self, txn_id: &TxnId) -> bool {
         match self {
             VarLock::ReadLocked(set) if set.len() == 1 && set.contains(txn_id) => {
@@ -163,11 +173,12 @@ impl VarLock {
                 true
             }
             VarLock::WriteLocked(tid) if tid == txn_id => true,
-            _ => false,
+            VarLock::Unlocked => false,
+            VarLock::ReadLocked(_) | VarLock::WriteLocked(_) => false,
         }
     }
 
-    /// Release any lock (read or write) held by txn_id.
+    /// Release any lock (read or write) held by `txn_id`
     pub fn release(&mut self, txn_id: &TxnId) {
         match self {
             VarLock::ReadLocked(_) => self.release_read(txn_id),
@@ -177,19 +188,22 @@ impl VarLock {
     }
 }
 
-/// Composite state for a single variable, consolidating value, lock, and
-/// transaction history into one structure instead of three separate maps.
+/// Composite state for a single variable represented by `VarState`
+///
+/// Consolidates value, lock, and transaction history into one
+/// structure instead of three separate maps
 #[derive(Debug, Clone)]
 pub struct VarState {
-    /// Current value of the variable.
+    /// Current value of the variable
     pub value: crate::runtime::ast::Value,
-    /// Lock state for 2-phase locking.
+    /// Lock state for two-phase locking
     pub lock: VarLock,
-    /// Most recent transaction to write this variable.
+    /// Most recent transaction to write this variable
     pub latest_write_txn: Option<TxnId>,
 }
 
 impl VarState {
+    /// Create a new `VarState` instance
     pub fn new(value: crate::runtime::ast::Value) -> Self {
         VarState {
             value,
@@ -199,29 +213,33 @@ impl VarState {
     }
 }
 
-/// Per-transaction state, owned by the code executing a transaction and passed
-/// around during execution rather than stored on the Manager. A single Manager
-/// may eventually run multiple transactions concurrently, so transaction state
-/// must not live on the Manager.
+/// Per-transaction state represented by `Transaction`
+///
+/// Owned by the code executing a transaction and passed around
+/// during execution rather than stored on the `Manager`
+///
+/// A single `Manager` may eventually run multiple transactions
+/// concurrently, so transaction state must not live on the `Manager`
 #[derive(Debug)]
 pub struct Transaction {
-    /// Globally unique transaction identifier.
+    /// Globally unique transaction identifier
     pub id: TxnId,
-    /// (service, variable) pairs this transaction currently holds a lock on.
-    pub locked: HashSet<(ServiceId, String)>,
+    /// Pairs of `(ServiceNetId, Symbol)` this transaction currently holds a lock on
+    pub locked: HashSet<(ServiceNetId, Symbol)>,
     /// Values already read in this transaction, keyed by (service, variable)
-    /// (avoids re-fetching, including redundant network round-trips).
-    pub read_cache: HashMap<(ServiceId, String), Value>,
+    /// (avoids re-fetching, including redundant network round-trips)
+    pub read_cache: HashMap<(ServiceNetId, Symbol), Value>,
     /// Values written by this transaction, keyed by (service, variable),
-    /// buffered and applied only on successful commit (so a failed transaction
-    /// leaves no partial writes).
-    pub written: HashMap<(ServiceId, String), Value>,
+    /// buffered and applied only on successful commit (so a failed
+    /// transaction leaves no partial writes)
+    pub written: HashMap<(ServiceNetId, Symbol), Value>,
     /// Remote nodes that joined this transaction (executed a composed action
-    /// under this id and are holding locks/buffered writes until commit/abort).
+    /// under this `id` and are holding locks or buffered writes until commit or abort)
     pub participants: HashSet<Address>,
 }
 
 impl Transaction {
+    /// Create a new `Transaction` instance
     pub fn new(id: TxnId) -> Self {
         Transaction {
             id,
@@ -233,9 +251,11 @@ impl Transaction {
     }
 }
 
-/// Outcome of a wait-die conflict check. The requesting transaction either
-/// waits for the lock (it is older / higher priority than every conflicting
-/// holder) or dies and retries (some current holder is older).
+/// Outcome of a wait-die conflict check represented by `WaitDie`
+///
+/// The requesting transaction either waits for the lock (it is older /
+/// higher priority than every conflicting holder) or dies and retries
+/// (some current holder is older)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitDie {
     Wait,
@@ -243,11 +263,12 @@ pub enum WaitDie {
 }
 
 impl VarLock {
-    /// Wait-die decision for a `requester` that conflicts with this lock.
-    /// Returns `Die` if any current holder is strictly older (smaller tid,
-    /// higher priority) than the requester; otherwise `Wait`. A holder equal
-    /// to the requester is ignored, since a transaction never conflicts with
-    /// itself.
+    /// Wait-die decision for a `requester` that conflicts with this lock
+    ///
+    /// Returns `Die` if any current holder is strictly older (smaller
+    /// `TxnId`, higher priority) than the `requester`; otherwise `Wait`
+    /// A holder equal to the `requester` is ignored, since a transaction
+    /// never conflicts with itself
     pub fn wait_die(&self, requester: &TxnId) -> WaitDie {
         let holder_older = match self {
             VarLock::Unlocked => false,

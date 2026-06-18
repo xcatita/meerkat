@@ -4,11 +4,14 @@ use clap::Parser;
 use meerkat_lib::net::network_layer::NetworkLayer;
 use meerkat_lib::net::types::NodeType;
 use meerkat_lib::net::NetworkActor;
-use meerkat_lib::net::{Address, MeerkatMessage, NetworkCommand, NetworkEvent, ServiceId};
-use meerkat_lib::runtime::ast::Stmt;
+use meerkat_lib::net::{
+    codec, Address, MeerkatMessage, NetworkCommand, NetworkEvent, NetworkReply, ServiceNetId,
+};
+use meerkat_lib::runtime::ast::{ActionStmt, AstPrinter, Stmt, Value};
+use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
-use meerkat_lib::runtime::Manager;
+use meerkat_lib::runtime::{parser, Manager};
 use std::collections::HashSet;
 use std::error::Error;
 
@@ -69,15 +72,17 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let mut interner = Interner::new();
+
     match args.input_file {
         Some(ref file) => {
-            let prog = meerkat_lib::runtime::parser::parse_file(file)
+            let prog = parser::parse_file(file, &mut interner)
                 .map_err(|e| format!("Parse error: {}", e))?;
 
             // This must appear prior to `check_only` or it will never print. These
             // modes are designed to work both in isolation and in tandem
             if args.ast {
-                let printer = meerkat_lib::runtime::ast::AstPrinter::new();
+                let printer = AstPrinter::new(&interner);
                 printer.print_program(&prog);
             }
 
@@ -96,9 +101,9 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             if args.server {
-                run_server(prog, remote_url_map, args.port, args.local).await
+                run_server(prog, remote_url_map, args.port, args.local, interner).await
             } else {
-                run_client(prog, file, remote_url_map, args.local).await
+                run_client(prog, file, remote_url_map, args.local, interner).await
             }
         }
         None => {
@@ -107,7 +112,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     "Expected a .mkt file (-f) for --server, --check, or --ast mode.".into(),
                 );
             }
-            let mut manager = Manager::new();
+            let mut manager = Manager::new(interner);
             manager.local = args.local;
             repl::run_repl(manager, remote_url_map).await
         }
@@ -129,12 +134,12 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
             tid,
         } => {
             match manager
-                .execute_action_participant(&service, &stmts, &env, tid.clone())
+                .execute_action_participant(service, &stmts, &env, tid.clone())
                 .await
             {
                 Err(EvalError::WaitOn(svc, var)) => {
                     manager.park_request(
-                        &svc,
+                        svc,
                         var,
                         ParkedRequest::Action {
                             request_id,
@@ -170,12 +175,12 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
             tid,
         } => {
             match manager
-                .remote_read_participant(&service, &member, tid.clone())
+                .remote_read_participant(service, member, tid.clone())
                 .await
             {
                 Err(EvalError::WaitOn(svc, var)) => {
                     manager.park_request(
-                        &svc,
+                        svc,
                         var,
                         ParkedRequest::Lookup {
                             request_id,
@@ -189,7 +194,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
                 Ok(val) => {
                     let response = MeerkatMessage::LookupResponse {
                         request_id,
-                        value: serde_json::to_string(&val).unwrap_or_default(),
+                        value: codec::encode_value(&val, &manager.interner),
                     };
                     if let Some(net) = manager.network.as_mut() {
                         net.handle_command(NetworkCommand::SendMessage {
@@ -219,7 +224,7 @@ async fn run_and_reply_or_park(manager: &mut Manager, parked: ParkedRequest) {
 
 /// After a holder releases its locks on commit or abort, re-dispatch the parked
 /// requests waiting on the freed variables, oldest first.
-async fn wake_ready(manager: &mut Manager, freed: HashSet<(ServiceId, String)>) {
+async fn wake_ready(manager: &mut Manager, freed: HashSet<(ServiceNetId, Symbol)>) {
     for parked in manager.take_ready_waiters(&freed) {
         run_and_reply_or_park(manager, parked).await;
     }
@@ -230,9 +235,10 @@ async fn run_server(
     remote_url_map: std::collections::HashMap<String, String>,
     port: u16,
     local: bool,
+    interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
     let mut net = NetworkActor::new(NodeType::Server).await?;
-    let mut manager = Manager::new();
+    let mut manager = Manager::new(interner);
     manager.local = local;
 
     let node_ip = manager.get_node_ip();
@@ -242,9 +248,11 @@ async fn run_server(
         .handle_command(NetworkCommand::Listen { addr: listen_addr })
         .await;
     let actual_addr = match reply {
-        meerkat_lib::net::NetworkReply::ListenSuccess { addr } => addr,
-        meerkat_lib::net::NetworkReply::Failure(e) => return Err(e.into()),
-        _ => return Err("Unexpected reply".into()),
+        NetworkReply::ListenSuccess { addr } => addr,
+        NetworkReply::Failure(e) => return Err(e.into()),
+        NetworkReply::MessageSent { .. } | NetworkReply::LocalAddresses { .. } => {
+            return Err("Unexpected reply".into())
+        }
     };
 
     let peer_id = net.local_peer_id();
@@ -259,15 +267,16 @@ async fn run_server(
     // Print service URLs
     for stmt in &prog {
         if let Stmt::Service { name, .. } = stmt {
-            println!("Service URL: {}/{}", full_addr, name);
+            println!("Service URL: {}/{}", full_addr, manager.interner.get(*name));
         }
     }
 
     // Register any remote services from -i flags
     for (svc_name, url) in &remote_url_map {
+        let svc_sym = manager.interner.insert(svc_name);
         manager
             .remote_services
-            .insert(svc_name.clone(), Address::new(url.as_str()));
+            .insert(svc_sym, Address::new(url.as_str()));
         println!("Remote service '{}' registered at {}", svc_name, url);
     }
 
@@ -282,10 +291,10 @@ async fn run_server(
     for stmt in &prog {
         if let Stmt::Service { name, decls } = stmt {
             manager
-                .create_service(name.clone(), decls.clone())
+                .create_service(*name, decls.clone())
                 .await
                 .map_err(|e| format!("Service error: {}", e))?;
-            println!("Service '{}' loaded", name);
+            println!("Service '{}' loaded", manager.interner.get(*name));
         }
     }
 
@@ -316,43 +325,47 @@ async fn run_server(
                     member,
                     reply_to,
                     txn_id,
-                } => match txn_id {
-                    // Transactional read: park if older than a holder.
-                    Some(tid) => {
-                        run_and_reply_or_park(
-                            &mut manager,
-                            ParkedRequest::Lookup {
-                                request_id,
-                                reply_to,
-                                service,
-                                member,
-                                tid,
-                            },
-                        )
-                        .await;
-                    }
-                    // Plain unlocked read: reply immediately.
-                    None => {
-                        let result = manager.lookup(&member, &service, None).await;
-                        let response = match result {
-                            Ok(val) => MeerkatMessage::LookupResponse {
-                                request_id,
-                                value: serde_json::to_string(&val).unwrap_or_default(),
-                            },
-                            Err(e) => MeerkatMessage::LookupError {
-                                request_id,
-                                error: e.to_string(),
-                            },
-                        };
-                        if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
+                } => {
+                    let svc_sym = manager.interner.insert(&service);
+                    let mem_sym = manager.interner.insert(&member);
+                    match txn_id {
+                        // Transactional read: park if older than a holder
+                        Some(tid) => {
+                            run_and_reply_or_park(
+                                &mut manager,
+                                ParkedRequest::Lookup {
+                                    request_id,
+                                    reply_to,
+                                    service: svc_sym,
+                                    member: mem_sym,
+                                    tid,
+                                },
+                            )
                             .await;
                         }
+                        // Plain unlocked read: reply immediately
+                        None => {
+                            let result = manager.lookup(mem_sym, svc_sym, None).await;
+                            let response = match result {
+                                Ok(val) => MeerkatMessage::LookupResponse {
+                                    request_id,
+                                    value: codec::encode_value(&val, &manager.interner),
+                                },
+                                Err(e) => MeerkatMessage::LookupError {
+                                    request_id,
+                                    error: e.to_string(),
+                                },
+                            };
+                            if let Some(net) = manager.network.as_mut() {
+                                net.handle_command(NetworkCommand::SendMessage {
+                                    addr: Address::new(&reply_to),
+                                    msg: response,
+                                })
+                                .await;
+                            }
+                        }
                     }
-                },
+                }
                 MeerkatMessage::ActionRequest {
                     request_id,
                     service,
@@ -360,42 +373,58 @@ async fn run_server(
                     env: action_env,
                     reply_to,
                     txn_id,
-                } => match txn_id {
-                    // Part of a distributed transaction: park if older
-                    // than a holder, otherwise reply.
-                    Some(tid) => {
-                        run_and_reply_or_park(
-                            &mut manager,
-                            ParkedRequest::Action {
-                                request_id,
-                                reply_to,
-                                service,
-                                stmts,
-                                env: action_env,
-                                tid,
-                            },
-                        )
-                        .await;
-                    }
-                    // Standalone: commit immediately and reply.
-                    None => {
-                        let result = manager
-                            .execute_action_with_env(&service, &stmts, &action_env)
-                            .await;
-                        let response = MeerkatMessage::ActionResponse {
-                            request_id,
-                            success: result.is_ok(),
-                            error: result.err().map(|e| e.to_string()),
-                        };
-                        if let Some(net) = manager.network.as_mut() {
-                            net.handle_command(NetworkCommand::SendMessage {
-                                addr: Address::new(&reply_to),
-                                msg: response,
-                            })
+                } => {
+                    let svc_sym = manager.interner.insert(&service);
+                    let local_stmts: Vec<ActionStmt> = stmts
+                        .into_iter()
+                        .map(|s| codec::decode_action_stmt(s, &mut manager.interner))
+                        .collect();
+                    let local_env: Vec<(Symbol, Value)> = action_env
+                        .into_iter()
+                        .map(|(k, v)| {
+                            (
+                                manager.interner.insert(&k),
+                                codec::decode_value(v, &mut manager.interner),
+                            )
+                        })
+                        .collect();
+                    match txn_id {
+                        // Part of a distributed transaction: park if older
+                        // than a holder, otherwise reply
+                        Some(tid) => {
+                            run_and_reply_or_park(
+                                &mut manager,
+                                ParkedRequest::Action {
+                                    request_id,
+                                    reply_to,
+                                    service: svc_sym,
+                                    stmts: local_stmts,
+                                    env: local_env,
+                                    tid,
+                                },
+                            )
                             .await;
                         }
+                        // Standalone: commit immediately and reply
+                        None => {
+                            let result = manager
+                                .execute_action_with_env(svc_sym, &local_stmts, &local_env)
+                                .await;
+                            let response = MeerkatMessage::ActionResponse {
+                                request_id,
+                                success: result.is_ok(),
+                                error: result.err().map(|e| e.to_string()),
+                            };
+                            if let Some(net) = manager.network.as_mut() {
+                                net.handle_command(NetworkCommand::SendMessage {
+                                    addr: Address::new(&reply_to),
+                                    msg: response,
+                                })
+                                .await;
+                            }
+                        }
                     }
-                },
+                }
                 MeerkatMessage::Commit {
                     request_id,
                     txn_id,
@@ -442,7 +471,17 @@ async fn run_server(
                     // abort just released.
                     wake_ready(&mut manager, freed).await;
                 }
-                _ => {}
+                MeerkatMessage::Ping { .. }
+                | MeerkatMessage::Pong { .. }
+                | MeerkatMessage::Announce { .. }
+                | MeerkatMessage::Transaction { .. }
+                | MeerkatMessage::Propagation { .. }
+                | MeerkatMessage::LookupResponse { .. }
+                | MeerkatMessage::LookupError { .. }
+                | MeerkatMessage::ActionResponse { .. }
+                | MeerkatMessage::CommitResponse { .. }
+                | MeerkatMessage::AbortResponse { .. }
+                | MeerkatMessage::WaitParked { .. } => {}
             }
         }
 
@@ -455,8 +494,9 @@ async fn run_client(
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     local: bool,
+    interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
-    let mut manager = Manager::new();
+    let mut manager = Manager::new(interner);
     manager.local = local;
 
     // Start network if we have remote imports
@@ -471,7 +511,7 @@ async fn run_client(
         let reply = n
             .handle_command(NetworkCommand::Listen { addr: listen_addr })
             .await;
-        if let meerkat_lib::net::NetworkReply::ListenSuccess { addr } = reply {
+        if let NetworkReply::ListenSuccess { addr } = reply {
             let node_ip = manager.get_node_ip();
             let peer_id = n.local_peer_id();
             let addr_str = addr
@@ -495,49 +535,63 @@ async fn run_client(
 
     for stmt in &prog {
         match stmt {
-            Stmt::Service { name, decls } => {
+            &Stmt::Service { name, ref decls } => {
                 manager
-                    .create_service(name.clone(), decls.clone())
+                    .create_service(name, decls.clone())
                     .await
                     .map_err(|e| format!("Service error: {}", e))?;
-                println!("Service '{}' loaded", name);
+                println!("Service '{}' loaded", manager.interner.get(name));
             }
-            Stmt::Test { service, stmts } => {
-                manager
-                    .execute_action(service, stmts)
-                    .await
-                    .map_err(|e| format!("Test failed in '{}': {}", service, e))?;
-                println!("@test({}) passed", service);
-            }
-            Stmt::Import {
-                path,
-                service: svc_name,
+            &Stmt::Test {
+                service_name,
+                ref stmts,
             } => {
-                if let Some(url) = remote_url_map.get(svc_name) {
+                manager
+                    .execute_action(service_name, stmts)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Test failed in '{}': {}",
+                            manager.interner.get(service_name),
+                            e
+                        )
+                    })?;
+                println!("@test({}) passed", manager.interner.get(service_name));
+            }
+            &Stmt::Import {
+                ref path,
+                service_name,
+            } => {
+                if let Some(url) = remote_url_map.get(manager.interner.get(service_name)) {
                     manager
                         .remote_services
-                        .insert(svc_name.clone(), Address::new(url.as_str()));
-                    println!("Remote service '{}' registered at {}", svc_name, url);
+                        .insert(service_name, Address::new(url.as_str()));
+                    println!(
+                        "Remote service '{}' registered at {}",
+                        manager.interner.get(service_name),
+                        url
+                    );
                 } else {
                     let base_dir = std::path::Path::new(input_file)
                         .parent()
                         .unwrap_or(std::path::Path::new("."));
                     let import_path = base_dir.join(path);
                     let import_stmts =
-                        meerkat_lib::runtime::parser::parse_file(import_path.to_str().unwrap())
+                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
                             .map_err(|e| format!("Import parse error: {}", e))?;
                     for import_stmt in &import_stmts {
-                        if let Stmt::Service { name, decls } = import_stmt {
+                        if let &Stmt::Service { name, ref decls } = import_stmt {
                             manager
-                                .create_service(name.clone(), decls.clone())
+                                .create_service(name, decls.clone())
                                 .await
                                 .map_err(|e| format!("Import service error: {}", e))?;
-                            println!("Imported service '{}'", name);
+                            println!("Imported service '{}'", manager.interner.get(name));
                         }
                     }
                 }
             }
-            _ => {}
+            &Stmt::ActionStmt(_) => {}
+            &Stmt::Update { .. } | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
         }
     }
 
