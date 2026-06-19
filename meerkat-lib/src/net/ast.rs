@@ -12,7 +12,7 @@ pub struct NetField {
     /// The name of the field
     pub name: String,
     /// The `NetDataType` of the field
-    pub type_: NetDataType,
+    pub ty: NetDataType,
 }
 
 /// Network representation of an action statement

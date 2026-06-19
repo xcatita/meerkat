@@ -133,7 +133,7 @@ Decls: Vec<Decl> = Decl*;
 
 Field: Field = {
    <i:Ident> ":" <t: DataType> "," => {
-    Field {name: i, type_: t}
+    Field {name: i, ty: t}
    } 
 }
 

@@ -144,9 +144,9 @@ impl<'a> AstPrinter<'a> {
     fn print_field(&self, field: &Field, indent: usize) {
         self.print_indent(indent);
         println!(
-            "Field: {{ name: {}, type_: {:?} }}",
+            "Field: {{ name: {}, ty: {:?} }}",
             self.format_symbol(field.name),
-            field.type_
+            field.ty
         );
     }
 

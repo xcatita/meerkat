@@ -372,7 +372,7 @@ pub fn decode_action_stmt(stmt: NetActionStmt, interner: &mut Interner) -> Actio
 pub fn encode_field(field: &Field, interner: &Interner) -> NetField {
     NetField {
         name: interner.get(field.name).to_string(),
-        type_: encode_datatype(&field.type_),
+        ty: encode_datatype(&field.ty),
     }
 }
 
@@ -387,7 +387,7 @@ pub fn encode_field(field: &Field, interner: &Interner) -> NetField {
 pub fn decode_field(field: NetField, interner: &mut Interner) -> Field {
     Field {
         name: interner.insert(&field.name),
-        type_: decode_datatype(field.type_),
+        ty: decode_datatype(field.ty),
     }
 }
 

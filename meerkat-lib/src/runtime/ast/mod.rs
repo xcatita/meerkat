@@ -185,7 +185,7 @@ pub enum Decl {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field {
     pub name: Symbol,
-    pub type_: DataType,
+    pub ty: DataType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
