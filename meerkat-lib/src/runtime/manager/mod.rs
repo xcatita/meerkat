@@ -359,8 +359,9 @@ impl Manager {
             }
         }
         Err(EvalError::VarNotFound(format!(
-            "Variable Symbol({}) not found in service Symbol({})",
-            var_name, service_name
+            "Variable '{}' not found in service '{}'",
+            self.interner.get(var_name),
+            self.interner.get(service_name)
         )))
     }
 
@@ -429,14 +430,15 @@ impl Manager {
                 var_state.value = value;
             } else {
                 return Err(EvalError::VarNotFound(format!(
-                    "Variable Symbol({}) not found in service Symbol({})",
-                    var_name, service_name
+                    "Variable '{}' not found in service '{}'",
+                    self.interner.get(var_name),
+                    self.interner.get(service_name)
                 )));
             }
         } else {
             return Err(EvalError::ServiceNotFound(format!(
-                "Service Symbol({}) not found",
-                service_name
+                "Service '{}' not found",
+                self.interner.get(service_name)
             )));
         }
 
@@ -497,7 +499,11 @@ impl Manager {
                         Err(e) => {
                             // Propagation is best-effort; durable retry of failed
                             // updates is tracked under issue #24 (async updates).
-                            log::warn!("propagation of def Symbol({}) failed: {}", def_name, e);
+                            log::warn!(
+                                "propagation of def '{}' failed: {}",
+                                self.interner.get(def_name),
+                                e
+                            );
                             continue;
                         }
                     };
@@ -624,7 +630,10 @@ impl Manager {
     ///     EvalError::ServiceNotFound: If the remote service is not registered
     fn remote_addr(&self, service: Symbol) -> Result<Address, EvalError> {
         let full_url = self.remote_services.get(&service).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!("Remote service Symbol({}) not found", service))
+            EvalError::ServiceNotFound(format!(
+                "Remote service '{}' not found",
+                self.interner.get(service)
+            ))
         })?;
         let service_str = self.interner.get(service);
         let addr_str = full_url.0.trim_end_matches(&format!("/{}", service_str));
@@ -750,8 +759,9 @@ impl Manager {
                 msg,
                 request_id,
                 format!(
-                    "Timeout waiting for remote lookup of Symbol({}).Symbol({})",
-                    service, member
+                    "Timeout waiting for remote lookup of '{}.{}'",
+                    self.interner.get(service),
+                    self.interner.get(member)
                 ),
             )
             .await?;
@@ -988,19 +998,21 @@ impl Manager {
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!("Service Symbol({}) not found", service_name))
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
         })?;
-        let var_state = service
-            .vars
-            .get_mut(&var)
-            .ok_or_else(|| EvalError::VarNotFound(format!("Variable Symbol({}) not found", var)))?;
+        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
+            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+        })?;
         if var_state.lock.try_write(txn_id) {
             Ok(())
         } else {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
-                    "transaction died contending for write lock on Symbol({})",
-                    var
+                    "transaction died contending for write lock on '{}'",
+                    self.interner.get(var)
                 ))),
                 crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
             }
@@ -1032,19 +1044,21 @@ impl Manager {
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!("Service Symbol({}) not found", service_name))
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
         })?;
-        let var_state = service
-            .vars
-            .get_mut(&var)
-            .ok_or_else(|| EvalError::VarNotFound(format!("Variable Symbol({}) not found", var)))?;
+        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
+            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+        })?;
         if var_state.lock.try_read(txn_id) {
             Ok(())
         } else {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
-                    "transaction died contending for read lock on Symbol({})",
-                    var
+                    "transaction died contending for read lock on '{}'",
+                    self.interner.get(var)
                 ))),
                 crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
             }
@@ -1075,19 +1089,21 @@ impl Manager {
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
         let service = self.services.get_mut(&service_name).ok_or_else(|| {
-            EvalError::ServiceNotFound(format!("Service Symbol({}) not found", service_name))
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
         })?;
-        let var_state = service
-            .vars
-            .get_mut(&var)
-            .ok_or_else(|| EvalError::VarNotFound(format!("Variable Symbol({}) not found", var)))?;
+        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
+            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+        })?;
         if var_state.lock.upgrade_to_write(txn_id) {
             Ok(())
         } else {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
-                    "transaction died contending to upgrade lock on Symbol({})",
-                    var
+                    "transaction died contending to upgrade lock on '{}'",
+                    self.interner.get(var)
                 ))),
                 crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
             }
