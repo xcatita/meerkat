@@ -1,4 +1,5 @@
 use meerkat_lib::runtime::ast::{Expr, Stmt, Value};
+use meerkat_lib::runtime::interner::Symbol;
 use meerkat_lib::runtime::interpreter::{eval, execute, EvalContext, ExecuteEffect};
 use meerkat_lib::runtime::parser::ReplParseResult;
 use meerkat_lib::runtime::parser::{parse_file, parse_repl};
@@ -12,22 +13,25 @@ use std::io::{self, IsTerminal};
 const PROMPT: &str = "meerkat> ";
 const PROMPT_CONT: &str = "       > ";
 
-/// A registered watch: the original source text, the expression, and its last known value.
+/// A registered watch represented by `Watch`
+///
+/// Keeps track of the original source text, the expression, and its
+/// last known value
 struct Watch {
     label: String,
     expr: Expr,
     last: Option<Value>,
 }
 
-/// Re-evaluate all watches and print any that have changed.
-async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &[(String, Value)]) {
+/// Re-evaluate all watches and print any that have changed
+async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &[(Symbol, Value)]) {
     for w in watches.iter_mut() {
         let result = eval(
             &w.expr,
             repl_env,
             &mut EvalContext {
                 manager,
-                service_name: "",
+                service_name: Symbol::empty(),
                 txn: None,
             },
         )
@@ -48,6 +52,7 @@ async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &
     }
 }
 
+/// Run the `REPL` loop for interactive execution
 pub async fn run_repl(
     mut manager: Manager,
     remote_url_map: std::collections::HashMap<String, String>,
@@ -89,7 +94,7 @@ pub async fn run_repl(
         manager.network = Some(n);
     }
 
-    let mut repl_env: Vec<(String, Value)> = Vec::new();
+    let mut repl_env: Vec<(Symbol, Value)> = Vec::new();
     let mut watches: Vec<Watch> = Vec::new();
 
     let mut buffer = String::new();
@@ -127,7 +132,7 @@ pub async fn run_repl(
             continue;
         }
 
-        match parse_repl(&buffer) {
+        match parse_repl(&buffer, &mut manager.interner) {
             ReplParseResult::Incomplete => {
                 continuation = true;
             }
@@ -171,58 +176,64 @@ pub async fn run_repl(
     Ok(())
 }
 
+/// Execute a single statement inside the `REPL` loop
 async fn exec_stmt(
     stmt: Stmt,
     manager: &mut Manager,
-    repl_env: &mut Vec<(String, Value)>,
+    repl_env: &mut Vec<(Symbol, Value)>,
     watches: &mut Vec<Watch>,
     remote_url_map: &std::collections::HashMap<String, String>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     match stmt {
         Stmt::Service { name, decls } => {
             manager
-                .create_service(name.clone(), decls)
+                .create_service(name, decls)
                 .await
-                .map_err(|e| format!("Service '{}': {}", name, e))?;
-            Ok(Some(format!("Service '{}' loaded.", name)))
+                .map_err(|e| format!("Service '{}': {}", manager.interner.get(name), e))?;
+            Ok(Some(format!(
+                "Service '{}' loaded.",
+                manager.interner.get(name)
+            )))
         }
-        Stmt::Test { service, stmts } => {
-            manager
-                .execute_action(&service, &stmts)
-                .await
-                .map_err(|e| format!("@test({}): {}", service, e))?;
-            Ok(Some(format!("@test({}) passed.", service)))
-        }
-        Stmt::Import {
-            path,
-            service: svc_name,
+        Stmt::Test {
+            service_name,
+            stmts,
         } => {
-            if let Some(url) = remote_url_map.get(&svc_name) {
-                manager.remote_services.insert(
-                    svc_name.clone(),
-                    meerkat_lib::net::Address::new(url.as_str()),
-                );
+            manager
+                .execute_action(service_name, &stmts)
+                .await
+                .map_err(|e| format!("@test({}): {}", manager.interner.get(service_name), e))?;
+            Ok(Some(format!(
+                "@test({}) passed.",
+                manager.interner.get(service_name)
+            )))
+        }
+        Stmt::Import { path, service_name } => {
+            let svc_name_str = manager.interner.get(service_name);
+            if let Some(url) = remote_url_map.get(svc_name_str) {
+                manager
+                    .remote_services
+                    .insert(service_name, meerkat_lib::net::Address::new(url.as_str()));
                 return Ok(Some(format!(
                     "Remote service '{}' registered at {}.",
-                    svc_name, url
+                    svc_name_str, url
                 )));
             }
-            let import_stmts =
-                parse_file(&path).map_err(|e| format!("Import '{}': {}", path, e))?;
+            let import_stmts = parse_file(&path, &mut manager.interner)
+                .map_err(|e| format!("Import '{}': {}", path, e))?;
             let mut loaded = Vec::new();
             for s in import_stmts {
                 if let Stmt::Service { name, decls } = s {
-                    manager
-                        .create_service(name.clone(), decls)
-                        .await
-                        .map_err(|e| format!("Imported service '{}': {}", name, e))?;
-                    loaded.push(name);
+                    manager.create_service(name, decls).await.map_err(|e| {
+                        format!("Imported service '{}': {}", manager.interner.get(name), e)
+                    })?;
+                    loaded.push(manager.interner.get(name).to_string());
                 }
             }
             Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
         }
         Stmt::ActionStmt(action_stmt) => {
-            let effect = execute(&action_stmt, repl_env, manager, "", None)
+            let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)
                 .await
                 .map_err(|e| format!("{}", e))?;
             match effect {
@@ -242,7 +253,7 @@ async fn exec_stmt(
                 repl_env,
                 &mut EvalContext {
                     manager,
-                    service_name: "",
+                    service_name: Symbol::empty(),
                     txn: None,
                 },
             )
@@ -259,9 +270,7 @@ async fn exec_stmt(
             });
             Ok(Some(msg))
         }
-        other => Ok(Some(format!(
-            "(not yet supported in REPL: {:?})",
-            std::mem::discriminant(&other)
-        ))),
+        Stmt::Update { .. } => Ok(Some("(not yet supported in REPL: Update)".to_string())),
+        Stmt::Connect { .. } => Ok(Some("(not yet supported in REPL: Connect)".to_string())),
     }
 }

@@ -1,15 +1,16 @@
-use crate::net::ServiceId;
+use crate::net::ServiceNetId;
+use crate::runtime::interner::Symbol;
 use std::fmt::Display;
 pub mod printer;
 pub use printer::AstPrinter;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnOp {
     Neg, // negate
     Not, // logical not
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -24,21 +25,21 @@ pub enum BinOp {
     Or,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ActionStmt {
-    Let { name: String, expr: Expr },
+    Let { name: Symbol, expr: Expr },
     Expr(Expr),
     Do(Expr),
     Assert(Expr),
-    Assign { var: String, expr: Expr },
-    Insert { row: Expr, table_name: String },
+    Assign { name: Symbol, expr: Expr },
+    Insert { row: Expr, table_name: Symbol },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Stmt {
     ActionStmt(ActionStmt),
     Update {
-        service: String,
+        service_name: Symbol,
         decls: Vec<Decl>,
     },
     Connect {
@@ -47,14 +48,14 @@ pub enum Stmt {
     },
     Import {
         path: String,
-        service: String,
+        service_name: Symbol,
     },
     Service {
-        name: String,
+        name: Symbol,
         decls: Vec<Decl>,
     },
     Test {
-        service: String,
+        service_name: Symbol,
         stmts: Vec<ActionStmt>,
     },
     Watch {
@@ -62,7 +63,7 @@ pub enum Stmt {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Value {
     Number {
         val: i32,
@@ -74,36 +75,38 @@ pub enum Value {
         val: String,
     },
     Closure {
-        params: Vec<String>,
+        params: Vec<Symbol>,
         body: Box<Expr>,
-        env: Vec<(String, Value)>,
-        service_name: String,
+        env: Vec<(Symbol, Value)>,
+        service_name: Symbol,
     },
     ActionClosure {
         stmts: Vec<ActionStmt>,
-        env: Vec<(String, Value)>,
-        /// Identity of the service this action belongs to. Carries the owning
-        /// node's address, so the action can be executed even if its service is
-        /// not imported into the scope where the closure is later used.
-        service: ServiceId,
+        env: Vec<(Symbol, Value)>,
+        /// Identity of the service this action belongs to
+        ///
+        /// Carries the owning node's address, so the action can be
+        /// executed even if its service is not imported into the scope
+        /// where the closure is later used
+        service_net_id: ServiceNetId,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expr {
     /// Basic Lambda Core expressions
     Literal {
         val: Value,
     },
     Variable {
-        ident: String,
+        name: Symbol,
     },
     Tuple {
         val: Vec<Expr>,
     },
     KeyVal {
-        // TODO: replace with a Record type (different from Tuple) that is a list of key value pairs
-        key: String,
+        // TODO: replace with a `Record` type (different from `Tuple`) that is a list of key value pairs
+        name: Symbol,
         value: Box<Expr>,
     },
     Unop {
@@ -123,7 +126,7 @@ pub enum Expr {
     },
 
     Func {
-        params: Vec<String>,
+        params: Vec<Symbol>,
         body: Box<Expr>,
     },
     Call {
@@ -135,27 +138,28 @@ pub enum Expr {
     Action(Vec<ActionStmt>),
 
     MemberAccess {
-        service: String,
-        member: String,
+        service_name: Symbol,
+        member_name: Symbol,
     },
     Select {
-        table_name: String,
-        column_names: Vec<String>,
+        table_name: Symbol,
+        column_names: Vec<Symbol>,
         where_clause: Box<Expr>,
     },
 
     Table {
-        // TODO: remove this, we should just have Records and Tuples
+        // TODO: remove this, we should just have `Record`s and `Tuple`s
         schema: Vec<Field>,
         records: Vec<Expr>,
-        /*How do records differ from rows?
-         Records only consist of data contained within tables: {1, "A", 18}
-         Rows are what are written inside insert statements, insert {id: 1, name: "A", age: 18};
-        */
+        /* How do records differ from rows?
+         *
+         * - Records only consist of data contained within tables: `{1, "A", 18}`
+         * - Rows are what are written inside insert statements: `insert {id: 1, name: "A", age: 18}`
+         */
     },
     Fold {
-        table_name: String,
-        column_name: String,
+        table_name: Symbol,
+        column_name: Symbol,
         operation: Box<Expr>,
         identity: Box<Expr>,
     },
@@ -164,27 +168,27 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Decl {
     VarDecl {
-        name: String,
+        name: Symbol,
         val: Expr,
     },
     DefDecl {
-        name: String,
+        name: Symbol,
         val: Expr,
         is_pub: bool,
     },
     TableDecl {
-        name: String,
+        name: Symbol,
         fields: Vec<Field>,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Field {
-    pub name: String,
-    pub type_: DataType,
+    pub name: Symbol,
+    pub ty: DataType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DataType {
     String,
     Number,
@@ -216,7 +220,17 @@ impl Display for BinOp {
     }
 }
 
+/// Implement the `Display` trait for the `Value` type
+///
+/// This prints a human-readable representation of runtime values
 impl Display for Value {
+    /// Format the value for display
+    ///
+    /// Args:
+    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
+    ///
+    /// Returns:
+    ///     `std::fmt::Result`: The result of the formatting operation
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Number { val } => write!(f, "{}", val),
@@ -224,29 +238,56 @@ impl Display for Value {
             Value::String { val } => write!(f, "\"{}\"", val),
             Value::Closure {
                 params, body, env, ..
-            } => write!(f, "fn({})[{:?}]{{{}}}", params.join(","), env, body),
+            } => {
+                let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+                let env_str: Vec<String> =
+                    env.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                write!(f, "fn({})[{:?}]{{{}}}", params_str.join(","), env_str, body)
+            }
             Value::ActionClosure {
                 stmts,
                 env,
-                service,
-            } => write!(f, "action[{:?}][{}]{{{:?}}}", env, service.0, stmts),
+                service_net_id,
+            } => {
+                let env_str: Vec<String> =
+                    env.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                write!(
+                    f,
+                    "action[{:?}][{}]{{{:?}}}",
+                    env_str, service_net_id.0, stmts
+                )
+            }
         }
     }
 }
 
+/// Implement the `Display` trait for the `Expr` type
+///
+/// This prints a human-readable representation of abstract syntax tree
+/// expressions
 impl Display for Expr {
+    /// Format the expression for display
+    ///
+    /// Args:
+    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
+    ///
+    /// Returns:
+    ///     `std::fmt::Result`: The result of the formatting operation
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Expr::Literal { val } => write!(f, "{}", val),
             Expr::Tuple { .. } => write!(f, "vector"),
-            Expr::KeyVal { key, value } => write!(f, "keyval: {}, {}", key, value),
-            Expr::Variable { ident } => write!(f, "{}", ident),
+            Expr::KeyVal { name, value } => write!(f, "keyval: {}, {}", name, value),
+            Expr::Variable { name } => write!(f, "{}", name),
             Expr::Unop { op, expr } => write!(f, "{}{}", op, expr),
             Expr::Binop { op, expr1, expr2 } => write!(f, "{} {} {}", expr1, op, expr2),
             Expr::If { cond, expr1, expr2 } => {
                 write!(f, "if {} then {} else {}", cond, expr1, expr2)
             }
-            Expr::Func { params, body } => write!(f, "fn({})[{}]", params.join(","), body),
+            Expr::Func { params, body } => {
+                let params_str: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+                write!(f, "fn({})[{}]", params_str.join(","), body)
+            }
             Expr::Call { func, args } => write!(
                 f,
                 "{}({})",
@@ -265,7 +306,10 @@ impl Display for Expr {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Expr::MemberAccess { service, member } => write!(f, "{}.{}", service, member),
+            Expr::MemberAccess {
+                service_name,
+                member_name,
+            } => write!(f, "{}.{}", service_name, member_name),
             Expr::Select { where_clause, .. } => write!(f, "{}", where_clause),
             Expr::Table { records, .. } => {
                 write!(f, "[",)?;
@@ -296,14 +340,24 @@ impl Display for Expr {
     }
 }
 
+/// Implement the `Display` trait for the `ActionStmt` type
+///
+/// This prints a human-readable representation of action statements
 impl Display for ActionStmt {
+    /// Format the action statement for display
+    ///
+    /// Args:
+    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
+    ///
+    /// Returns:
+    ///     `std::fmt::Result`: The result of the formatting operation
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ActionStmt::Let { name, expr } => write!(f, "let {} = {}", name, expr),
             ActionStmt::Expr(expr) => write!(f, "{}", expr),
             ActionStmt::Do(expr) => write!(f, "do {}", expr),
             ActionStmt::Assert(expr) => write!(f, "assert {}", expr),
-            ActionStmt::Assign { var, expr } => write!(f, "{} = {}", var, expr),
+            ActionStmt::Assign { name, expr } => write!(f, "{} = {}", name, expr),
             ActionStmt::Insert { row, table_name } => {
                 write!(f, "insert into {} {}", table_name, row)
             }
@@ -311,7 +365,17 @@ impl Display for ActionStmt {
     }
 }
 
+/// Implement the `Display` trait for the `Decl` type
+///
+/// This prints a human-readable representation of declarations
 impl Display for Decl {
+    /// Format the declaration for display
+    ///
+    /// Args:
+    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
+    ///
+    /// Returns:
+    ///     `std::fmt::Result`: The result of the formatting operation
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Decl::VarDecl { name, val } => {

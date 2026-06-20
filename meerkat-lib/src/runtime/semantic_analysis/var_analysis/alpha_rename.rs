@@ -1,21 +1,26 @@
-use core::panic;
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{ActionStmt, Expr};
+use crate::runtime::interner::Symbol;
 
 impl Expr {
-    /// alpha renaming of expression e
-    /// rename x1, x2, ..., x_n to y1, y2, ..., y_n if x is free in expression e
+    /// Alpha renaming of expression `self`
+    ///
+    /// Rename variables if they are free in expression `self`
+    ///
+    /// Args:
+    ///     `var_binded` (`&HashSet<Symbol>`): The set of bound symbols
+    ///     `renames` (`&HashMap<Symbol, Symbol>`): The map of renames to apply
     pub fn alpha_rename(
         &mut self,
-        var_binded: &HashSet<String>,
-        renames: &HashMap<String, String>,
+        var_binded: &HashSet<Symbol>,
+        renames: &HashMap<Symbol, Symbol>,
     ) {
         match self {
             Expr::Literal { .. } => {}
-            Expr::Variable { ident } => {
-                if !var_binded.contains(ident) && renames.contains_key(ident) {
-                    *ident = renames.get(ident).unwrap().clone();
+            Expr::Variable { name } => {
+                if !var_binded.contains(name) && renames.contains_key(name) {
+                    *name = *renames.get(name).unwrap();
                 }
             }
             Expr::KeyVal { value, .. } => {
@@ -52,11 +57,6 @@ impl Expr {
 
             Expr::Action(stmts) => {
                 for stmt in stmts {
-                    // dest should never be renamed, not influenced by capture
-                    // let dest = &mut assn.dest;
-                    // if !var_binded.contains(dest) && renames.contains_key(dest){
-                    //     *dest = renames.get(dest).unwrap().clone();
-                    // }
                     stmt.alpha_rename(var_binded, renames);
                 }
             }
@@ -82,14 +82,18 @@ impl Expr {
 }
 
 impl ActionStmt {
+    /// Perform alpha renaming on an `ActionStmt`
+    ///
+    /// Args:
+    ///     `_var_binded` (`&HashSet<Symbol>`): The set of bound symbols
+    ///     `_renames` (`&HashMap<Symbol, Symbol>`): The map of renames to apply
     pub fn alpha_rename(
         &mut self,
-        // Added underscores to silence warnings due to this being a stub.
-        _var_binded: &HashSet<String>,
-        _renames: &HashMap<String, String>,
+        _var_binded: &HashSet<Symbol>,
+        _renames: &HashMap<Symbol, Symbol>,
     ) {
-        // TODO: Implement alpha renaming for ActionStmt based on its structure
-        // This is a placeholder - adjust based on ActionStmt's actual fields
+        // TODO: Implement alpha renaming for `ActionStmt` based on its structure
+        // This is a placeholder; adjust based on `ActionStmt`'s actual fields
         panic!("alpha_rename for ActionStmt is not implemented yet");
     }
 }

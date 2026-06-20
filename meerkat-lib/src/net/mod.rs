@@ -1,4 +1,6 @@
 pub mod actor;
+pub mod ast;
+pub mod codec;
 pub mod messages;
 pub mod mock;
 pub mod network_layer;

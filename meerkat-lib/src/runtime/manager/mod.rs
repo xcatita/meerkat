@@ -2,7 +2,11 @@ use super::ast::{ActionStmt, Decl, Expr, Value};
 use super::interpreter::{eval, execute, EvalContext, EvalError, ExecuteEffect};
 use super::semantic_analysis::var_analysis::{calc_dep_srv, DependAnalysis};
 use crate::net::network_layer::NetworkLayer;
-use crate::net::{Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, ServiceId};
+use crate::net::{
+    codec, Address, MeerkatMessage, NetworkActor, NetworkCommand, NetworkEvent, NetworkReply,
+    ServiceNetId,
+};
+use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::txn::{Transaction, TxnId, VarState};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
@@ -10,11 +14,11 @@ use tokio::time::Duration;
 
 pub struct Service {
     /// Globally unique identity of this service (address-based when networked).
-    pub id: ServiceId,
-    pub name: String,
+    pub id: ServiceNetId,
+    pub name: Symbol,
     /// Per-variable state: value, lock, and latest write transaction in one place
-    pub vars: HashMap<String, VarState>,
-    pub defs: HashMap<String, Expr>, // original def expressions for re-evaluation
+    pub vars: HashMap<Symbol, VarState>,
+    pub defs: HashMap<Symbol, Expr>, // original def expressions for re-evaluation
     pub dep: DependAnalysis,         // dependency graph + topo order
 }
 
@@ -26,16 +30,16 @@ pub enum ParkedRequest {
     Action {
         request_id: u64,
         reply_to: String,
-        service: String,
+        service: Symbol,
         stmts: Vec<ActionStmt>,
-        env: Vec<(String, Value)>,
+        env: Vec<(Symbol, Value)>,
         tid: TxnId,
     },
     Lookup {
         request_id: u64,
         reply_to: String,
-        service: String,
-        member: String,
+        service: Symbol,
+        member: Symbol,
         tid: TxnId,
     },
 }
@@ -52,9 +56,9 @@ impl ParkedRequest {
 }
 
 pub struct Manager {
-    pub services: HashMap<String, Service>,
+    pub services: HashMap<Symbol, Service>,
     /// Maps service name to remote address (for distributed services)
-    pub remote_services: HashMap<String, Address>,
+    pub remote_services: HashMap<Symbol, Address>,
     /// Network actor for distributed communication
     pub network: Option<NetworkActor>,
     /// Pending reply channels keyed by request_id
@@ -69,7 +73,7 @@ pub struct Manager {
     /// Requests parked because the requesting transaction is older than a lock
     /// holder (wait-die wait), keyed by the contended (service, var). Drained
     /// oldest-first when that variable's lock frees on commit or abort.
-    pub wait_queue: HashMap<(ServiceId, String), Vec<ParkedRequest>>,
+    pub wait_queue: HashMap<(ServiceNetId, Symbol), Vec<ParkedRequest>>,
     /// This node's canonical, dialable address, set once after the network is
     /// listening. Service identities are derived from it, so they are stable for
     /// the life of the process (never empty-then-populated) and match the URL
@@ -77,10 +81,12 @@ pub struct Manager {
     local_address: Option<String>,
     /// Enable local loopback mode
     pub local: bool,
+    /// String interner
+    pub interner: Interner,
 }
 
 impl Manager {
-    pub fn new() -> Self {
+    pub fn new(interner: Interner) -> Self {
         Manager {
             services: HashMap::new(),
             remote_services: HashMap::new(),
@@ -91,13 +97,15 @@ impl Manager {
             wait_queue: HashMap::new(),
             local_address: None,
             local: false,
+            interner,
         }
     }
 
-    /// Park a request on the wait queue for the contended (service, var). It
-    /// receives no reply until that variable's lock frees and it is re-dispatched.
-    pub fn park_request(&mut self, service: &str, var: String, parked: ParkedRequest) {
-        let key = (self.id_for_service(service), var);
+    /// Park a request on the wait queue for the contended `(service, var)`
+    /// It receives no reply until that variable's lock frees and it is
+    /// re-dispatched
+    pub fn park_request(&mut self, service: Symbol, var: Symbol, parked: ParkedRequest) {
+        let key = (self.service_net_id_for_name(service), var);
         self.wait_queue.entry(key).or_default().push(parked);
     }
 
@@ -107,7 +115,7 @@ impl Manager {
     /// being starved by a stream of younger requests.
     pub fn take_ready_waiters(
         &mut self,
-        freed: &HashSet<(ServiceId, String)>,
+        freed: &HashSet<(ServiceNetId, Symbol)>,
     ) -> Vec<ParkedRequest> {
         let mut ready = Vec::new();
         for key in freed {
@@ -172,50 +180,56 @@ impl Manager {
         out
     }
 
-    /// Record this node's canonical address once the network is listening, so
-    /// service identities are stable and consistent with the advertised URL.
+    /// Record this node's canonical address once the network is listening,
+    /// so service identities are stable and consistent with the
+    /// advertised URL
     pub fn set_local_address(&mut self, addr: String) {
         self.local_address = Some(addr);
     }
 
-    /// Compute the global identity of a service owned by this node. When the
-    /// node has a network address, the identity is that address plus the service
-    /// slug; otherwise it falls back to the bare name for local-only execution.
-    fn service_identity(&self, name: &str) -> ServiceId {
+    /// Compute the global identity of a service owned by this node. When
+    /// the node has a network address, the identity is that address plus
+    /// the service slug; otherwise it falls back to the bare name for
+    /// local-only execution
+    fn compute_service_net_id(&self, service_name: Symbol) -> ServiceNetId {
+        let name_str = self.interner.get(service_name);
         match &self.local_address {
-            Some(addr) if !addr.is_empty() => ServiceId::new(format!("{}/{}", addr, name)),
-            // No network address: fall back to the bare name. On a single node
-            // names are unambiguous, and because local_address is fixed at
-            // startup this choice never changes mid-run.
-            _ => ServiceId::new(name),
+            Some(addr) if !addr.is_empty() => ServiceNetId::new(format!("{}/{}", addr, name_str)),
+            Some(_) | None => {
+                // No network address: fall back to the bare name. On a
+                // single node names are unambiguous, and because
+                // `local_address` is fixed at startup this choice never
+                // changes mid-run
+                ServiceNetId::new(name_str)
+            }
         }
     }
 
     pub async fn create_service(
         &mut self,
-        name: String,
+        name: Symbol,
         decls: Vec<Decl>,
     ) -> Result<(), EvalError> {
         let dep = calc_dep_srv(&decls);
 
-        let id = self.service_identity(&name);
-        // Register the service (with its real ServiceId) before evaluating any
-        // declarations, so action closures built during initialization are
-        // stamped with the correct ServiceId instead of id_for_service's
-        // bare-name fallback.
+        let id = self.compute_service_net_id(name);
+        // Register the service (with its real `ServiceNetId`) before
+        // evaluating any declarations, so action closures built during
+        // initialization are stamped with the correct `ServiceNetId`
+        // instead of `service_net_id_for_name`'s bare-name fallback
         self.services.insert(
-            name.clone(),
+            name,
             Service {
                 id,
-                name: name.clone(),
+                name,
                 vars: HashMap::new(),
                 defs: HashMap::new(),
                 dep,
             },
         );
 
-        let mut env: Vec<(String, Value)> = vec![];
-        let svc_name = name.clone();
+        let mut env: Vec<(Symbol, Value)> = vec![];
+        let svc_name = name;
 
         for decl in decls {
             match decl {
@@ -225,12 +239,12 @@ impl Manager {
                         &env,
                         &mut EvalContext {
                             manager: self,
-                            service_name: &svc_name,
+                            service_name: svc_name,
                             txn: None,
                         },
                     )
                     .await?;
-                    env.push((name.clone(), value.clone()));
+                    env.push((name, value.clone()));
                     if let Some(service) = self.services.get_mut(&svc_name) {
                         service.vars.insert(name, VarState::new(value));
                     }
@@ -241,14 +255,14 @@ impl Manager {
                         &env,
                         &mut EvalContext {
                             manager: self,
-                            service_name: &svc_name,
+                            service_name: svc_name,
                             txn: None,
                         },
                     )
                     .await?;
-                    env.push((name.clone(), value.clone()));
+                    env.push((name, value.clone()));
                     if let Some(service) = self.services.get_mut(&svc_name) {
-                        service.vars.insert(name.clone(), VarState::new(value));
+                        service.vars.insert(name, VarState::new(value));
                         service.defs.insert(name, val); // store original expr
                     }
                 }
@@ -261,30 +275,46 @@ impl Manager {
         Ok(())
     }
 
+    /// Lookup a variable or def's value within a service
+    ///
+    /// Evaluates stored def expressions to ensure freshness and acquires
+    /// appropriate read locks when executed inside a transaction.
+    ///
+    /// Args:
+    ///     var_name (Symbol): The symbol of the variable or definition to look up
+    ///     service_name (Symbol): The symbol of the service containing the variable
+    ///     txn (Option<&mut Transaction>): An optional active transaction context
+    ///
+    /// Returns:
+    ///     Result<Value, EvalError>: The retrieved runtime value, or an error
+    ///
+    /// Raises:
+    ///     EvalError::VarNotFound: If the variable does not exist in the service
+    ///     EvalError::ServiceNotFound: If the service is not found
     pub async fn lookup(
         &mut self,
-        ident: &str,
-        service_name: &str,
+        var_name: Symbol,
+        service_name: Symbol,
         mut txn: Option<&mut Transaction>,
     ) -> Result<Value, EvalError> {
         // Check if service is remote
-        if self.remote_services.contains_key(service_name) {
-            return self.remote_lookup(service_name, ident, txn).await;
+        if self.remote_services.contains_key(&service_name) {
+            return self.remote_lookup(service_name, var_name, txn).await;
         }
 
         // If it's a def, re-evaluate from stored expression for freshness.
         // The transaction flows through so the def's underlying vars are locked.
         let def_expr = self
             .services
-            .get(service_name)
-            .and_then(|s| s.defs.get(ident))
+            .get(&service_name)
+            .and_then(|s| s.defs.get(&var_name))
             .cloned();
 
         if let Some(expr) = def_expr {
             // Evaluate the def with an empty env so its dependencies resolve
             // through lookup (acquiring read locks and populating the cache)
             // rather than being pre-seeded from current service var values.
-            let env: Vec<(String, Value)> = Vec::new();
+            let env: Vec<(Symbol, Value)> = Vec::new();
             return eval(
                 &expr,
                 &env,
@@ -301,7 +331,7 @@ impl Manager {
         // present, otherwise acquire a read lock lazily and cache the value.
         // Transaction state is keyed by (service id, variable) so the same name
         // in different services never collides.
-        let key = (self.id_for_service(service_name), ident.to_string());
+        let key = (self.service_net_id_for_name(service_name), var_name);
         let mut need_read_lock: Option<TxnId> = None;
         if let Some(t) = txn.as_deref() {
             if let Some(cached) = t.read_cache.get(&key) {
@@ -312,15 +342,15 @@ impl Manager {
             }
         }
         if let Some(txn_id) = need_read_lock {
-            self.acquire_read_lock(service_name, ident, &txn_id)?;
+            self.acquire_read_lock(service_name, var_name, &txn_id)?;
             if let Some(t) = txn.as_deref_mut() {
                 t.locked.insert(key.clone());
             }
         }
 
         // Return stored var value (and cache it for the transaction)
-        if let Some(service) = self.services.get(service_name) {
-            if let Some(var_state) = service.vars.get(ident) {
+        if let Some(service) = self.services.get(&service_name) {
+            if let Some(var_state) = service.vars.get(&var_name) {
                 let value = var_state.value.clone();
                 if let Some(t) = txn {
                     t.read_cache.insert(key, value.clone());
@@ -328,16 +358,35 @@ impl Manager {
                 return Ok(value);
             }
         }
-        Err(EvalError::LookupError(format!(
+        Err(EvalError::VarNotFound(format!(
             "Variable '{}' not found in service '{}'",
-            ident, service_name
+            self.interner.get(var_name),
+            self.interner.get(service_name)
         )))
     }
 
+    /// Assign a value to a service variable
+    ///
+    /// In a transaction, this acquires a write lock (or upgrades an existing read lock)
+    /// and buffers the write. Non-transactional writes are applied immediately and propagated.
+    ///
+    /// Args:
+    ///     service_name (Symbol): The symbol of the service containing the variable
+    ///     var_name (Symbol): The symbol of the variable to assign
+    ///     value (Value): The value to assign to the variable
+    ///     txn (Option<&mut Transaction>): An optional active transaction context
+    ///
+    /// Returns:
+    ///     Result<(), EvalError>: Ok on success, or a lock/validation error
+    ///
+    /// Raises:
+    ///     EvalError::VarNotFound: If the variable does not exist in the service
+    ///     EvalError::ServiceNotFound: If the service is not found
+    ///     EvalError::WaitDieAbort: If the transaction aborts due to lock contention
     pub async fn assign(
         &mut self,
-        service_name: &str,
-        var: &str,
+        service_name: Symbol,
+        var_name: Symbol,
         value: Value,
         txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
@@ -346,7 +395,7 @@ impl Manager {
         // write. The buffered value is applied to the service only at commit, so
         // a transaction that fails partway leaves no partial writes behind.
         if txn.is_some() {
-            let key = (self.id_for_service(service_name), var.to_string());
+            let key = (self.service_net_id_for_name(service_name), var_name);
             enum LockAction {
                 Acquire,
                 Upgrade,
@@ -361,8 +410,10 @@ impl Manager {
                 (t.id.clone(), kind)
             };
             match kind {
-                LockAction::Upgrade => self.upgrade_to_write_lock(service_name, var, &txn_id)?,
-                LockAction::Acquire => self.acquire_write_lock(service_name, var, &txn_id)?,
+                LockAction::Upgrade => {
+                    self.upgrade_to_write_lock(service_name, var_name, &txn_id)?
+                }
+                LockAction::Acquire => self.acquire_write_lock(service_name, var_name, &txn_id)?,
             }
             if let Some(t) = txn {
                 t.locked.insert(key.clone());
@@ -374,46 +425,47 @@ impl Manager {
         }
 
         // Non-transactional path: apply the write immediately and propagate.
-        if let Some(service) = self.services.get_mut(service_name) {
-            if let Some(var_state) = service.vars.get_mut(var) {
+        if let Some(service) = self.services.get_mut(&service_name) {
+            if let Some(var_state) = service.vars.get_mut(&var_name) {
                 var_state.value = value;
             } else {
-                return Err(EvalError::LookupError(format!(
+                return Err(EvalError::VarNotFound(format!(
                     "Variable '{}' not found in service '{}'",
-                    var, service_name
+                    self.interner.get(var_name),
+                    self.interner.get(service_name)
                 )));
             }
         } else {
-            return Err(EvalError::LookupError(format!(
+            return Err(EvalError::ServiceNotFound(format!(
                 "Service '{}' not found",
-                service_name
+                self.interner.get(service_name)
             )));
         }
 
         // propagate: re-evaluate defs that depend on this var in topo order
-        self.propagate(service_name, var).await;
+        self.propagate(service_name, var_name).await;
         Ok(())
     }
 
-    async fn propagate(&mut self, service_name: &str, changed_var: &str) {
+    async fn propagate(&mut self, service_name: Symbol, changed_var: Symbol) {
         // collect defs that need re-evaluation in topo order
-        let topo_order: Vec<String> = self
+        let topo_order: Vec<Symbol> = self
             .services
-            .get(service_name)
+            .get(&service_name)
             .map(|s| s.dep.topo_order.clone())
             .unwrap_or_default();
 
         for def_name in topo_order {
             let needs_update = self
                 .services
-                .get(service_name)
+                .get(&service_name)
                 .and_then(|s| s.dep.dep_vars.get(&def_name))
-                .map(|dep_vars| dep_vars.contains(changed_var))
+                .map(|dep_vars| dep_vars.contains(&changed_var))
                 .unwrap_or(false);
 
             let is_def = self
                 .services
-                .get(service_name)
+                .get(&service_name)
                 .map(|s| s.defs.contains_key(&def_name))
                 .unwrap_or(false);
 
@@ -421,20 +473,15 @@ impl Manager {
                 // build env from current var values
                 let expr = self
                     .services
-                    .get(service_name)
+                    .get(&service_name)
                     .and_then(|s| s.defs.get(&def_name))
                     .cloned();
 
                 if let Some(expr) = expr {
-                    let env: Vec<(String, Value)> = self
+                    let env: Vec<(Symbol, Value)> = self
                         .services
-                        .get(service_name)
-                        .map(|s| {
-                            s.vars
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.value.clone()))
-                                .collect()
-                        })
+                        .get(&service_name)
+                        .map(|s| s.vars.iter().map(|(k, v)| (*k, v.value.clone())).collect())
                         .unwrap_or_default();
 
                     let value = match eval(
@@ -452,12 +499,16 @@ impl Manager {
                         Err(e) => {
                             // Propagation is best-effort; durable retry of failed
                             // updates is tracked under issue #24 (async updates).
-                            log::warn!("propagation of def '{}' failed: {}", def_name, e);
+                            log::warn!(
+                                "propagation of def '{}' failed: {}",
+                                self.interner.get(def_name),
+                                e
+                            );
                             continue;
                         }
                     };
 
-                    if let Some(service) = self.services.get_mut(service_name) {
+                    if let Some(service) = self.services.get_mut(&service_name) {
                         if let Some(var_state) = service.vars.get_mut(&def_name) {
                             var_state.value = value;
                         }
@@ -480,23 +531,31 @@ impl Manager {
                         MeerkatMessage::ActionResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
-                        MeerkatMessage::WaitParked { request_id } => Some(*request_id),
-                        _ => None,
+                        MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
+                        MeerkatMessage::Ping { .. }
+                        | MeerkatMessage::Pong { .. }
+                        | MeerkatMessage::Announce { .. }
+                        | MeerkatMessage::Transaction { .. }
+                        | MeerkatMessage::Propagation { .. }
+                        | MeerkatMessage::LookupRequest { .. }
+                        | MeerkatMessage::ActionRequest { .. }
+                        | MeerkatMessage::Commit { .. }
+                        | MeerkatMessage::Abort { .. } => None,
                     };
-                    if let Some(id) = rid {
-                        if let Some(tx) = self.pending_replies.remove(&id) {
+                    if let Some(request_id) = rid {
+                        if let Some(tx) = self.pending_replies.remove(&request_id) {
                             let _ = tx.send(msg);
                         }
                     }
                 }
-                Some(_) => {}
+                Some(NetworkEvent::SendFailed { .. }) => {}
+                Some(NetworkEvent::PeerConnected { .. }) => {}
+                Some(NetworkEvent::PeerDisconnected { .. }) => {}
                 None => break,
             }
         }
     }
 
-    /// Send a message and await a reply using tokio::select! for timeout.
-    /// Encapsulates the duplicated send + register channel + await pattern
     /// shared by remote_lookup and remote_action.
     async fn send_and_await_reply(
         &mut self,
@@ -506,10 +565,9 @@ impl Manager {
         timeout_msg: String,
     ) -> Result<MeerkatMessage, EvalError> {
         // Send the message
-        let net = self
-            .network
-            .as_mut()
-            .ok_or_else(|| EvalError::NetworkError("No network layer available".to_string()))?;
+        let net = self.network.as_mut().ok_or_else(|| {
+            EvalError::LocalDispatchFailed("No network layer available".to_string())
+        })?;
         net.handle_command(NetworkCommand::SendMessage { addr, msg })
             .await;
 
@@ -543,7 +601,7 @@ impl Manager {
                         }
                         Ok(msg) => return Ok(msg),
                         Err(_) => {
-                            return Err(EvalError::NetworkError(
+                            return Err(EvalError::LocalDispatchFailed(
                                 "Reply channel closed".to_string(),
                             ))
                         }
@@ -551,19 +609,34 @@ impl Manager {
                 }
                 _ = &mut timeout => {
                     self.pending_replies.remove(&request_id);
-                    return Err(EvalError::NetworkError(timeout_msg));
+                    return Err(EvalError::LocalDispatchFailed(timeout_msg));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
         }
     }
 
-    /// Get the network address for a remote service (strips the slug)
-    fn remote_addr(&self, service: &str) -> Result<Address, EvalError> {
-        let full_url = self.remote_services.get(service).ok_or_else(|| {
-            EvalError::LookupError(format!("Remote service '{}' not found", service))
+    /// Retrieve the network address associated with a remote service symbol
+    ///
+    /// Strips the trailing service slug from the registered service URL.
+    ///
+    /// Args:
+    ///     service (Symbol): The remote service symbol to look up
+    ///
+    /// Returns:
+    ///     Result<Address, EvalError>: The target remote network address
+    ///
+    /// Raises:
+    ///     EvalError::ServiceNotFound: If the remote service is not registered
+    fn remote_addr(&self, service: Symbol) -> Result<Address, EvalError> {
+        let full_url = self.remote_services.get(&service).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!(
+                "Remote service '{}' not found",
+                self.interner.get(service)
+            ))
         })?;
-        let addr_str = full_url.0.trim_end_matches(&format!("/{}", service));
+        let service_str = self.interner.get(service);
+        let addr_str = full_url.0.trim_end_matches(&format!("/{}", service_str));
         Ok(Address::new(addr_str))
     }
 
@@ -581,7 +654,7 @@ impl Manager {
         let reply = net.handle_command(NetworkCommand::GetLocalAddresses).await;
         let node_ip = self.get_node_ip();
         match reply {
-            crate::net::NetworkReply::LocalAddresses { addrs } => {
+            NetworkReply::LocalAddresses { addrs } => {
                 if let Some(addr) = addrs.first() {
                     let addr_str = addr
                         .0
@@ -592,13 +665,12 @@ impl Manager {
                     String::new()
                 }
             }
-            _ => String::new(),
+            NetworkReply::MessageSent { .. }
+            | NetworkReply::ListenSuccess { .. }
+            | NetworkReply::Failure(_) => String::new(),
         }
     }
 
-    /// Generate a probabilistically-unique node id with no extra dependency.
-    /// RandomState is OS-seeded on native targets; combining it with the current
-    /// time gives a value that is distinct across nodes with high probability.
     fn random_node_id() -> u64 {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
@@ -627,10 +699,25 @@ impl Manager {
             .unwrap_or_else(|_| "127.0.0.1".to_string())
     }
 
+    /// Perform a remote variable lookup over the network
+    ///
+    /// Sends a lookup query to the node owning the remote service and registers
+    /// the local node as a transaction participant.
+    ///
+    /// Args:
+    ///     service (Symbol): The remote service symbol
+    ///     member (Symbol): The member/variable symbol within the service
+    ///     txn (Option<&mut Transaction>): The active transaction context
+    ///
+    /// Returns:
+    ///     Result<Value, EvalError>: The retrieved value, or a network/timeout error
+    ///
+    /// Raises:
+    ///     EvalError::LocalDispatchFailed: If a timeout or dispatch error occurs
     pub async fn remote_lookup(
         &mut self,
-        service: &str,
-        member: &str,
+        service: Symbol,
+        member: Symbol,
         txn: Option<&mut Transaction>,
     ) -> Result<Value, EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -660,8 +747,8 @@ impl Manager {
 
         let msg = MeerkatMessage::LookupRequest {
             request_id,
-            service: service.to_string(),
-            member: member.to_string(),
+            service: self.interner.get(service).to_string(),
+            member: self.interner.get(member).to_string(),
             reply_to,
             txn_id: shared_tid,
         };
@@ -672,20 +759,33 @@ impl Manager {
                 msg,
                 request_id,
                 format!(
-                    "Timeout waiting for remote lookup of {}.{}",
-                    service, member
+                    "Timeout waiting for remote lookup of '{}.{}'",
+                    self.interner.get(service),
+                    self.interner.get(member)
                 ),
             )
             .await?;
 
         match reply {
             MeerkatMessage::LookupResponse { value, .. } => {
-                let val: Value = serde_json::from_str(&value)
-                    .map_err(|e| EvalError::NetworkError(e.to_string()))?;
+                let val = codec::decode_value(value, &mut self.interner)
+                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
                 Ok(val)
             }
-            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LookupError(error)),
-            _ => Err(EvalError::NetworkError(
+            MeerkatMessage::LookupError { error, .. } => Err(EvalError::LocalDispatchFailed(error)),
+            MeerkatMessage::Ping { .. }
+            | MeerkatMessage::Pong { .. }
+            | MeerkatMessage::Announce { .. }
+            | MeerkatMessage::Transaction { .. }
+            | MeerkatMessage::Propagation { .. }
+            | MeerkatMessage::LookupRequest { .. }
+            | MeerkatMessage::ActionRequest { .. }
+            | MeerkatMessage::ActionResponse { .. }
+            | MeerkatMessage::Commit { .. }
+            | MeerkatMessage::CommitResponse { .. }
+            | MeerkatMessage::Abort { .. }
+            | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to lookup request".to_string(),
             )),
         }
@@ -697,8 +797,8 @@ impl Manager {
     /// node already prepared for the same transaction.
     pub async fn remote_read_participant(
         &mut self,
-        service: &str,
-        member: &str,
+        service: Symbol,
+        member: Symbol,
         tid: TxnId,
     ) -> Result<Value, EvalError> {
         let mut txn = self
@@ -727,18 +827,19 @@ impl Manager {
 
     pub async fn remote_action(
         &mut self,
-        service_id: &ServiceId,
+        service_net_id: &ServiceNetId,
         stmts: Vec<ActionStmt>,
-        env: Vec<(String, Value)>,
+        env: Vec<(Symbol, Value)>,
         txn: Option<&mut Transaction>,
     ) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
 
-        // Dial the node address embedded in the ServiceId; send the slug as the
-        // service name the remote node uses to find its local service. This works
-        // even if the service was never imported into the current scope (#40).
-        let (addr, slug) = Self::split_service_id(service_id);
+        // Dial the node address embedded in the `ServiceNetId`; send the
+        // slug as the service name the remote node uses to find its local
+        // service. This works even if the service was never imported
+        // into the current scope
+        let (addr, slug) = Self::split_service_net_id(service_net_id);
         let request_id = NEXT_ACTION_ID.fetch_add(1, Ordering::SeqCst);
         let reply_to = self.local_reply_addr().await;
 
@@ -747,22 +848,39 @@ impl Manager {
         // commit/abort. Standalone (no txn) keeps the old commit-immediately path.
         let shared_tid = txn.as_ref().map(|t| t.id.clone());
 
-        // Pre-register the participant BEFORE sending. If the request times out
-        // or the response is lost after the remote already prepared and grabbed
-        // locks, the originator's abort path still iterates txn.participants and
-        // reaches this node to release them. If the remote never received the
-        // request, the Abort it gets is a harmless no-op.
+        // Pre-register the participant BEFORE sending. If the request times
+        // out or the response is lost after the remote already prepared
+        // and grabbed locks, the originator's abort path still iterates
+        // `txn.participants` and reaches this node to release them. If
+        // the remote never received the request, the `Abort` it gets is a
+        // harmless no-op
         if shared_tid.is_some() {
             if let Some(t) = txn {
                 t.participants.insert(addr.clone());
             }
         }
 
+        let mut net_stmts = Vec::new();
+        for s in &stmts {
+            net_stmts.push(
+                codec::encode_action_stmt(s, &self.interner)
+                    .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?,
+            );
+        }
+
+        let mut net_env = Vec::new();
+        for (sym, val) in env {
+            let key_str = self.interner.get(sym).to_string();
+            let enc_val = codec::encode_value(&val, &self.interner)
+                .map_err(|e| EvalError::LocalDispatchFailed(e.to_string()))?;
+            net_env.push((key_str, enc_val));
+        }
+
         let msg = MeerkatMessage::ActionRequest {
             request_id,
             service: slug.clone(),
-            stmts,
-            env,
+            stmts: net_stmts,
+            env: net_env,
             reply_to,
             txn_id: shared_tid,
         };
@@ -782,148 +900,220 @@ impl Manager {
                     // Participant already registered above; nothing more to do.
                     Ok(())
                 } else {
-                    Err(EvalError::NetworkError(
+                    Err(EvalError::LocalDispatchFailed(
                         error.unwrap_or_else(|| "Remote action failed".to_string()),
                     ))
                 }
             }
-            _ => Err(EvalError::NetworkError(
+            MeerkatMessage::Ping { .. }
+            | MeerkatMessage::Pong { .. }
+            | MeerkatMessage::Announce { .. }
+            | MeerkatMessage::Transaction { .. }
+            | MeerkatMessage::Propagation { .. }
+            | MeerkatMessage::LookupRequest { .. }
+            | MeerkatMessage::LookupResponse { .. }
+            | MeerkatMessage::LookupError { .. }
+            | MeerkatMessage::ActionRequest { .. }
+            | MeerkatMessage::Commit { .. }
+            | MeerkatMessage::CommitResponse { .. }
+            | MeerkatMessage::Abort { .. }
+            | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to action request".to_string(),
             )),
         }
     }
 
-    /// Resolve an in-scope service name to its global ServiceId. Callers only
-    /// resolve names of local services here (remote reads and actions are routed
-    /// before reaching this), so this returns the service's stored, stable id.
-    /// The bare-name fallback is a defensive default for an unknown name and is
-    /// not used for genuine remote services, whose identities travel embedded in
-    /// their ActionClosures.
-    pub fn id_for_service(&self, service_name: &str) -> ServiceId {
-        self.services
-            .get(service_name)
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| ServiceId::new(service_name))
-    }
-
-    /// Find a local service (mutably) by its ServiceId.
-    fn service_by_id_mut(&mut self, id: &ServiceId) -> Option<&mut Service> {
-        self.services.values_mut().find(|s| &s.id == id)
-    }
-
-    /// Find the in-scope name of a local service from its ServiceId.
-    pub fn name_for_id(&self, id: &ServiceId) -> Option<String> {
-        self.services
-            .iter()
-            .find(|(_, s)| &s.id == id)
-            .map(|(n, _)| n.clone())
-    }
-
-    /// Split a service identity into the dialable node address and the service
-    /// slug (its trailing name segment). Lets remote_action use the address
-    /// embedded in an ActionClosure's ServiceId rather than requiring the
-    /// service to be imported into the current scope.
-    fn split_service_id(id: &ServiceId) -> (Address, String) {
-        match id.0.rfind('/') {
-            Some(i) => (Address::new(&id.0[..i]), id.0[i + 1..].to_string()),
-            None => (Address::new(String::new()), id.0.clone()),
+    /// Resolve an in-scope service name to its global `ServiceNetId`
+    ///
+    /// Callers only resolve names of local services here (remote reads
+    /// and actions are routed before reaching this), so this returns
+    /// the service's stored, stable ID
+    ///
+    /// The bare-name fallback is a defensive default for an unknown
+    /// name and is not used for genuine remote services, whose
+    /// identities travel embedded in their `ActionClosure`s
+    pub fn service_net_id_for_name(&self, service_name: Symbol) -> ServiceNetId {
+        if let Some(service) = self.services.get(&service_name) {
+            service.id.clone()
+        } else if let Some(addr) = self.remote_services.get(&service_name) {
+            ServiceNetId::new(addr.0.clone())
+        } else {
+            ServiceNetId::new(self.interner.get(service_name))
         }
     }
 
-    /// Try to acquire a write lock on a service variable.
-    /// Returns LockConflict if the variable is already locked.
+    /// Find a local service (mutably) by its `ServiceNetId`
+    fn service_by_net_id_mut(&mut self, service_net_id: &ServiceNetId) -> Option<&mut Service> {
+        self.services.values_mut().find(|s| &s.id == service_net_id)
+    }
+
+    /// Find the in-scope name of a local service from its `ServiceNetId`
+    pub fn service_name_for_net_id(&self, service_net_id: &ServiceNetId) -> Option<Symbol> {
+        self.services
+            .iter()
+            .find(|(_, s)| &s.id == service_net_id)
+            .map(|(n, _)| *n)
+    }
+
+    /// Split a service identity into the dialable node address and the
+    /// service slug (its trailing name segment)
+    ///
+    /// Allows `remote_action` to use the address embedded in an
+    /// `ActionClosure`'s `ServiceNetId` rather than requiring the
+    /// service to be imported into the current scope
+    fn split_service_net_id(service_net_id: &ServiceNetId) -> (Address, String) {
+        match service_net_id.0.rfind('/') {
+            Some(i) => (
+                Address::new(&service_net_id.0[..i]),
+                service_net_id.0[i + 1..].to_string(),
+            ),
+            None => (Address::new(String::new()), service_net_id.0.clone()),
+        }
+    }
+
+    /// Attempt to acquire a write lock on a service variable
+    ///
+    /// If lock contention occurs, determines whether the transaction
+    /// should wait or die according to the wait-die deadlock prevention
+    /// scheme
+    ///
+    /// Args:
+    ///     `service_name` (`Symbol`): The symbol of the service
+    ///     `var` (`Symbol`): The symbol of the variable to lock
+    ///     `txn_id` (`&TxnId`): The ID of the requesting transaction
+    ///
+    /// Returns:
+    ///     `Result<(), EvalError>`: `Ok` on successful lock acquisition, or an error
+    ///
+    /// Raises:
+    ///     `EvalError::VarNotFound`: If the variable does not exist
+    ///     `EvalError::ServiceNotFound`: If the service does not exist
+    ///     `EvalError::WaitDieAbort`: If the transaction aborts under wait-die
+    ///     `EvalError::WaitOn`: If the transaction must wait for the lock
     fn acquire_write_lock(
         &mut self,
-        service_name: &str,
-        var: &str,
+        service_name: Symbol,
+        var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
-        let service = self.services.get_mut(service_name).ok_or_else(|| {
-            EvalError::LookupError(format!("Service '{}' not found", service_name))
+        let service = self.services.get_mut(&service_name).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
         })?;
-        let var_state = service
-            .vars
-            .get_mut(var)
-            .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
+        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
+            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+        })?;
         if var_state.lock.try_write(txn_id) {
             Ok(())
         } else {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending for write lock on '{}'",
-                    var
+                    self.interner.get(var)
                 ))),
-                crate::runtime::txn::WaitDie::Wait => {
-                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
-                }
+                crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
             }
         }
     }
 
-    /// Try to acquire a read lock on a service variable.
-    /// Returns LockConflict if a write lock is held.
+    /// Attempt to acquire a read lock on a service variable
+    ///
+    /// Multi-readers can share read locks, but will conflict with write locks
+    /// Uses wait-die deadlock prevention on contention
+    ///
+    /// Args:
+    ///     `service_name` (`Symbol`): The symbol of the service
+    ///     `var` (`Symbol`): The symbol of the variable to lock
+    ///     `txn_id` (`&TxnId`): The ID of the requesting transaction
+    ///
+    /// Returns:
+    ///     `Result<(), EvalError>`: `Ok` on successful lock acquisition, or an error
+    ///
+    /// Raises:
+    ///     `EvalError::VarNotFound`: If the variable does not exist
+    ///     `EvalError::ServiceNotFound`: If the service does not exist
+    ///     `EvalError::WaitDieAbort`: If the transaction aborts under wait-die
+    ///     `EvalError::WaitOn`: If the transaction must wait for the lock
     fn acquire_read_lock(
         &mut self,
-        service_name: &str,
-        var: &str,
+        service_name: Symbol,
+        var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
-        let service = self.services.get_mut(service_name).ok_or_else(|| {
-            EvalError::LookupError(format!("Service '{}' not found", service_name))
+        let service = self.services.get_mut(&service_name).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
         })?;
-        let var_state = service
-            .vars
-            .get_mut(var)
-            .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
+        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
+            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+        })?;
         if var_state.lock.try_read(txn_id) {
             Ok(())
         } else {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending for read lock on '{}'",
-                    var
+                    self.interner.get(var)
                 ))),
-                crate::runtime::txn::WaitDie::Wait => {
-                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
-                }
+                crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
             }
         }
     }
 
-    /// Upgrade a read lock to a write lock on a service variable.
-    /// Used for read-then-write within the same transaction (e.g. x = x + 1).
+    /// Upgrade an existing read lock to a write lock on a service variable
+    ///
+    /// Used for read-then-write patterns in transactions to avoid conflicts
+    ///
+    /// Args:
+    ///     `service_name` (`Symbol`): The symbol of the service
+    ///     `var` (`Symbol`): The symbol of the variable to lock
+    ///     `txn_id` (`&TxnId`): The ID of the requesting transaction
+    ///
+    /// Returns:
+    ///     `Result<(), EvalError>`: `Ok` on successful lock upgrade, or an error
+    ///
+    /// Raises:
+    ///     `EvalError::VarNotFound`: If the variable does not exist
+    ///     `EvalError::ServiceNotFound`: If the service does not exist
+    ///     `EvalError::WaitDieAbort`: If the transaction aborts under wait-die
+    ///     `EvalError::WaitOn`: If the transaction must wait for the lock
     fn upgrade_to_write_lock(
         &mut self,
-        service_name: &str,
-        var: &str,
+        service_name: Symbol,
+        var: Symbol,
         txn_id: &TxnId,
     ) -> Result<(), EvalError> {
-        let service = self.services.get_mut(service_name).ok_or_else(|| {
-            EvalError::LookupError(format!("Service '{}' not found", service_name))
+        let service = self.services.get_mut(&service_name).ok_or_else(|| {
+            EvalError::ServiceNotFound(format!(
+                "Service '{}' not found",
+                self.interner.get(service_name)
+            ))
         })?;
-        let var_state = service
-            .vars
-            .get_mut(var)
-            .ok_or_else(|| EvalError::LookupError(format!("Variable '{}' not found", var)))?;
+        let var_state = service.vars.get_mut(&var).ok_or_else(|| {
+            EvalError::VarNotFound(format!("Variable '{}' not found", self.interner.get(var)))
+        })?;
         if var_state.lock.upgrade_to_write(txn_id) {
             Ok(())
         } else {
             match var_state.lock.wait_die(txn_id) {
                 crate::runtime::txn::WaitDie::Die => Err(EvalError::WaitDieAbort(format!(
                     "transaction died contending to upgrade lock on '{}'",
-                    var
+                    self.interner.get(var)
                 ))),
-                crate::runtime::txn::WaitDie::Wait => {
-                    Err(EvalError::WaitOn(service_name.to_string(), var.to_string()))
-                }
+                crate::runtime::txn::WaitDie::Wait => Err(EvalError::WaitOn(service_name, var)),
             }
         }
     }
 
-    /// Release all locks held by txn_id on the given variables.
-    fn release_locks(&mut self, locked: &HashSet<(ServiceId, String)>, txn_id: &TxnId) {
+    /// Release all locks held by `txn_id` on the given variables
+    fn release_locks(&mut self, locked: &HashSet<(ServiceNetId, Symbol)>, txn_id: &TxnId) {
         for (sid, var) in locked {
-            if let Some(service) = self.service_by_id_mut(sid) {
+            if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.lock.release(txn_id);
                 }
@@ -931,43 +1121,37 @@ impl Manager {
         }
     }
 
-    /// Execute action statements as a transaction with lazy lock acquisition:
+    /// Execute action statements as a transaction with lazy lock
+    /// acquisition
     ///
-    /// Locks are acquired on demand as each variable is first read or written
-    /// during execution (inside `lookup` and `assign`), rather than upfront.
-    /// This handles actions invoked via function calls and conditional branches,
-    /// where the set of accessed variables can't be determined statically.
-    /// Read values are cached in the transaction to avoid re-fetching (which
-    /// also avoids redundant network round-trips for remote reads).
+    /// Locks are acquired on demand as each variable is first read or
+    /// written during execution (inside `lookup` and `assign`), rather
+    /// than upfront.
+    /// This handles actions invoked via function calls and conditional
+    /// branches, where the set of accessed variables cannot be
+    /// determined statically.
+    /// Read values are cached in the transaction to avoid re-fetching
+    /// (which also avoids redundant network round-trips for remote
+    /// reads)
     ///
-    /// On completion: commit records latest_write_txn for written variables,
-    /// then all locks are released (always, even on error).
+    /// On completion, a commit records `latest_write_txn` for written
+    /// variables, then all locks are released (always, even on error)
     ///
-    /// Deadlock prevention (wait-die) is deferred to a follow-up issue.
-    /// If a lock cannot be acquired, the transaction fails immediately.
+    /// If a lock cannot be acquired, wait-die deadlock prevention
+    /// determines whether the transaction waits or dies
     pub async fn execute_action_with_txn(
         &mut self,
-        service_name: &str,
+        service_name: Symbol,
         stmts: &[ActionStmt],
-        initial_env: &[(String, Value)],
+        initial_env: &[(Symbol, Value)],
     ) -> Result<(), EvalError> {
-        // Wait-die: a transaction that dies on a lock conflict (an older
-        // transaction holds the lock) aborts and retries with a higher
-        // iteration but the same age, bounded so a permanently held lock
-        // cannot loop forever. True blocking for the "wait" case (the older
-        // transaction holding its place) is tracked separately under #30
-        // stage 2.
         const MAX_WAIT_DIE_RETRIES: u32 = 10;
         let mut txn_id = TxnId::new(self.node_id);
 
         loop {
-            // The transaction owns all its state and is passed down through
-            // execution; nothing transaction-specific lives on the Manager.
             let mut txn = Transaction::new(txn_id.clone());
 
-            // Execute statements; read/write locks are acquired lazily inside
-            // lookup/assign as variables are accessed
-            let mut env: Vec<(String, Value)> = initial_env.to_vec();
+            let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
             let mut exec_error: Option<EvalError> = None;
             for stmt in stmts {
                 match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
@@ -980,10 +1164,6 @@ impl Manager {
                 }
             }
 
-            // Wait-die abort: discard this attempt, abort participants, release
-            // locks, and retry with a higher iteration up to the bound. A died
-            // attempt never applies its buffered writes, so re-running from
-            // scratch is safe.
             if matches!(exec_error, Some(EvalError::WaitDieAbort(_))) {
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
@@ -996,26 +1176,17 @@ impl Manager {
                 return Err(exec_error.unwrap());
             }
 
-            // The commit/abort decision depends only on whether execution
-            // succeeded. Once execution succeeds the writes are applied and
-            // become visible, so commit messaging to participants is
-            // best-effort and never turns a successful transaction into a
-            // failed one (commit retries are tracked separately under issue
-            // #54).
             if exec_error.is_none() {
                 self.apply_committed_writes(&txn).await;
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     let _ = self.send_commit(addr, &txn.id).await;
                 }
             } else {
-                // Execution failed: discard buffered writes and abort
-                // participants.
                 for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                     self.send_abort(addr, &txn.id).await;
                 }
             }
 
-            // Release all locks held locally (always, even on error)
             self.release_locks(&txn.locked, &txn.id);
 
             return match exec_error {
@@ -1025,54 +1196,53 @@ impl Manager {
         }
     }
 
-    /// Apply a transaction's buffered writes to the owning services, record the
-    /// writing transaction, and propagate to dependent defs. Shared by local
-    /// commit and by a participant committing on a remote Commit message.
-    /// Infallible: once we are applying writes the transaction is committed, so
-    /// there is no going back. Propagation is best-effort (retries: issue #24).
+    /// Apply a transaction's buffered writes to the owning services, record
+    /// the writing transaction, and propagate to dependent definitions
+    ///
+    /// Shared by local commit and by a participant committing on a remote
+    /// `Commit` message
+    ///
+    /// Infallible: once we are applying writes the transaction is
+    /// committed, so there is no going back. Propagation is best-effort
     async fn apply_committed_writes(&mut self, txn: &Transaction) {
-        let writes: Vec<((ServiceId, String), Value)> = txn
+        let writes: Vec<((ServiceNetId, Symbol), Value)> = txn
             .written
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let txn_id = txn.id.clone();
         for ((sid, var), value) in &writes {
-            if let Some(service) = self.service_by_id_mut(sid) {
+            if let Some(service) = self.service_by_net_id_mut(sid) {
                 if let Some(var_state) = service.vars.get_mut(var) {
                     var_state.value = value.clone();
                     var_state.latest_write_txn = Some(txn_id.clone());
                 }
             }
         }
-        // Propagate after all writes are applied so defs see a consistent state.
         for ((sid, var), _) in &writes {
-            if let Some(name) = self.name_for_id(sid) {
-                self.propagate(&name, var).await;
+            if let Some(name) = self.service_name_for_net_id(sid) {
+                self.propagate(name, *var).await;
             }
         }
     }
 
-    /// Participant side: execute a composed action under a shared transaction id
-    /// received from the originator, then hold the transaction (locks + buffered
-    /// writes) in `pending_txns` until a Commit or Abort arrives. Does not commit.
+    /// Participant side: execute a composed action under a shared transaction
+    /// ID received from the originator, then hold the transaction (locks and
+    /// buffered writes) in `pending_txns` until a `Commit` or `Abort` arrives
+    ///
+    /// Does not commit
     pub async fn execute_action_participant(
         &mut self,
-        service_name: &str,
+        service_name: Symbol,
         stmts: &[ActionStmt],
-        initial_env: &[(String, Value)],
+        initial_env: &[(Symbol, Value)],
         tid: TxnId,
     ) -> Result<(), EvalError> {
-        // Reuse an already-prepared transaction for this id if this node was
-        // already touched by the same distributed transaction (two services on
-        // one host, or transitive re-entry); otherwise start fresh. Pulling it
-        // out of pending_txns gives ownership so we can borrow &mut self below,
-        // and lets repeated actions accumulate into one prepared state.
         let mut txn = self
             .pending_txns
             .remove(&tid)
             .unwrap_or_else(|| Transaction::new(tid.clone()));
-        let mut env: Vec<(String, Value)> = initial_env.to_vec();
+        let mut env: Vec<(Symbol, Value)> = initial_env.to_vec();
         let mut exec_error: Option<EvalError> = None;
         for stmt in stmts {
             match execute(stmt, &env, self, service_name, Some(&mut txn)).await {
@@ -1085,40 +1255,26 @@ impl Manager {
             }
         }
         if let Some(e) = exec_error {
-            // Wait-die wait: this transaction is older than a current holder and
-            // must wait for the contended variable to free. Preserve its partial
-            // locks and buffered writes in pending_txns so that a re-dispatch on
-            // release skips the locks it already holds (guarded by txn.locked)
-            // and resumes at the contended variable. The owner parks the
-            // request; nothing is released here.
             if matches!(e, EvalError::WaitOn(_, _)) {
                 self.pending_txns.insert(tid, txn);
                 return Err(e);
             }
-            // Any other failure: release all locks held by this (possibly merged)
-            // transaction; do not keep it prepared. The originator's abort for
-            // this tid will then be a safe no-op here.
             self.release_locks(&txn.locked, &txn.id);
             return Err(e);
         }
-        // Prepared: hold the accumulated locks and buffered writes until commit/abort.
         self.pending_txns.insert(tid, txn);
         Ok(())
     }
 
-    /// Participant side: apply and release a held transaction on Commit.
+    /// Participant side: apply and release a held transaction on `Commit`
     pub async fn commit_participant(
         &mut self,
         tid: &TxnId,
-    ) -> Result<HashSet<(ServiceId, String)>, EvalError> {
+    ) -> Result<HashSet<(ServiceNetId, Symbol)>, EvalError> {
         if let Some(txn) = self.pending_txns.remove(tid) {
-            // The originator decided to commit, so applying is infallible.
             let freed = txn.locked.clone();
             self.apply_committed_writes(&txn).await;
             self.release_locks(&txn.locked, &txn.id);
-            // Forward the commit down the chain to any sub-participants this node
-            // composed (transitive composition: s1 -> s2 -> s3 ...). Forwarding
-            // failures are reported back but cannot undo the local commit.
             let mut forward_err = None;
             for addr in txn.participants.iter().cloned().collect::<Vec<_>>() {
                 if let Err(e) = self.send_commit(addr, tid).await {
@@ -1134,9 +1290,9 @@ impl Manager {
         }
     }
 
-    /// Participant side: discard and release a held transaction on Abort, and
-    /// forward the abort down the chain to any sub-participants.
-    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<(ServiceId, String)> {
+    /// Participant side: discard and release a held transaction on `Abort`, and
+    /// forward the abort down the chain to any sub-participants
+    pub async fn abort_participant(&mut self, tid: &TxnId) -> HashSet<(ServiceNetId, Symbol)> {
         if let Some(txn) = self.pending_txns.remove(tid) {
             let freed = txn.locked.clone();
             self.release_locks(&txn.locked, &txn.id);
@@ -1149,7 +1305,7 @@ impl Manager {
         }
     }
 
-    /// Originator side: ask a participant to commit, awaiting its acknowledgement.
+    /// Originator side: ask a participant to commit, awaiting its acknowledgement
     async fn send_commit(&mut self, addr: Address, tid: &TxnId) -> Result<(), EvalError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT_COMMIT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1173,12 +1329,25 @@ impl Manager {
                 if success {
                     Ok(())
                 } else {
-                    Err(EvalError::NetworkError(
+                    Err(EvalError::LocalDispatchFailed(
                         error.unwrap_or_else(|| "Participant commit failed".to_string()),
                     ))
                 }
             }
-            _ => Err(EvalError::NetworkError(
+            MeerkatMessage::Ping { .. }
+            | MeerkatMessage::Pong { .. }
+            | MeerkatMessage::Announce { .. }
+            | MeerkatMessage::Transaction { .. }
+            | MeerkatMessage::Propagation { .. }
+            | MeerkatMessage::LookupRequest { .. }
+            | MeerkatMessage::LookupResponse { .. }
+            | MeerkatMessage::LookupError { .. }
+            | MeerkatMessage::ActionRequest { .. }
+            | MeerkatMessage::ActionResponse { .. }
+            | MeerkatMessage::Commit { .. }
+            | MeerkatMessage::Abort { .. }
+            | MeerkatMessage::AbortResponse { .. }
+            | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to commit".to_string(),
             )),
         }
@@ -1212,7 +1381,7 @@ impl Manager {
 
     pub async fn execute_action(
         &mut self,
-        service_name: &str,
+        service_name: Symbol,
         stmts: &[ActionStmt],
     ) -> Result<(), EvalError> {
         self.execute_action_with_txn(service_name, stmts, &[]).await
@@ -1220,9 +1389,9 @@ impl Manager {
 
     pub async fn execute_action_with_env(
         &mut self,
-        service_name: &str,
+        service_name: Symbol,
         stmts: &[ActionStmt],
-        initial_env: &[(String, Value)],
+        initial_env: &[(Symbol, Value)],
     ) -> Result<(), EvalError> {
         self.execute_action_with_txn(service_name, stmts, initial_env)
             .await
@@ -1231,7 +1400,7 @@ impl Manager {
 
 impl Default for Manager {
     fn default() -> Self {
-        Self::new()
+        Self::new(Interner::new())
     }
 }
 
@@ -1240,40 +1409,75 @@ mod tests {
     use super::*;
     use crate::ast::{Decl, Expr, Value};
 
+    struct TestContext {
+        manager: Manager,
+        foo: Symbol,
+        x: Symbol,
+        y: Symbol,
+        f: Symbol,
+        s1: Symbol,
+        s2: Symbol,
+        w: Symbol,
+        bump: Symbol,
+        nonexistent: Symbol,
+    }
+
+    impl TestContext {
+        fn new() -> Self {
+            let mut manager = Manager::default();
+            let foo = manager.interner.insert("foo");
+            let x = manager.interner.insert("x");
+            let y = manager.interner.insert("y");
+            let f = manager.interner.insert("f");
+            let s1 = manager.interner.insert("s1");
+            let s2 = manager.interner.insert("s2");
+            let w = manager.interner.insert("w");
+            let bump = manager.interner.insert("bump");
+            let nonexistent = manager.interner.insert("nonexistent");
+            Self {
+                manager,
+                foo,
+                x,
+                y,
+                f,
+                s1,
+                s2,
+                w,
+                bump,
+                nonexistent,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_create_service_with_var() {
-        let mut manager = Manager::new();
+        let mut tc = TestContext::new();
         let decls = vec![Decl::VarDecl {
-            name: "x".to_string(),
+            name: tc.x,
             val: Expr::Literal {
                 val: Value::Number { val: 1 },
             },
         }];
-        manager
-            .create_service("foo".to_string(), decls)
-            .await
-            .unwrap();
-        let result = manager.lookup("x", "foo", None).await.unwrap();
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Number { val: 1 });
     }
 
     #[tokio::test]
     async fn test_create_service_with_def() {
-        let mut manager = Manager::new();
+        let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: "x".to_string(),
+                name: tc.x,
                 val: Expr::Literal {
                     val: Value::Number { val: 2 },
                 },
             },
             Decl::DefDecl {
-                name: "f".to_string(),
+                name: tc.f,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable {
-                        ident: "x".to_string(),
-                    }),
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Number { val: 3 },
                     }),
@@ -1281,43 +1485,34 @@ mod tests {
                 is_pub: true,
             },
         ];
-        manager
-            .create_service("foo".to_string(), decls)
-            .await
-            .unwrap();
-        let result = manager.lookup("f", "foo", None).await.unwrap();
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Number { val: 5 });
     }
 
     #[tokio::test]
     async fn test_lookup_missing_var_returns_error() {
-        let mut manager = Manager::new();
-        manager
-            .create_service("foo".to_string(), vec![])
-            .await
-            .unwrap();
-        let result = manager.lookup("nonexistent", "foo", None).await;
+        let mut tc = TestContext::new();
+        tc.manager.create_service(tc.foo, vec![]).await.unwrap();
+        let result = tc.manager.lookup(tc.nonexistent, tc.foo, None).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_def_updates_after_var_change() {
-        let mut manager = Manager::new();
-        // service foo { var x = 1; def f = x + 10; }
+        let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: "x".to_string(),
+                name: tc.x,
                 val: Expr::Literal {
                     val: Value::Number { val: 1 },
                 },
             },
             Decl::DefDecl {
-                name: "f".to_string(),
+                name: tc.f,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable {
-                        ident: "x".to_string(),
-                    }),
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Number { val: 10 },
                     }),
@@ -1325,168 +1520,168 @@ mod tests {
                 is_pub: true,
             },
         ];
-        manager
-            .create_service("foo".to_string(), decls)
-            .await
-            .unwrap();
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
 
         // f should be 11 initially
-        let result = manager.lookup("f", "foo", None).await.unwrap();
+        let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Number { val: 11 });
 
         // update x to 5, f should become 15
-        manager
-            .assign("foo", "x", Value::Number { val: 5 }, None)
+        tc.manager
+            .assign(tc.foo, tc.x, Value::Number { val: 5 }, None)
             .await
             .unwrap();
-        let result = manager.lookup("f", "foo", None).await.unwrap();
+        let result = tc.manager.lookup(tc.f, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Number { val: 15 });
     }
 
     // Helper: service with a single var x = 0
-    async fn manager_with_x() -> Manager {
-        let mut manager = Manager::new();
+    async fn manager_with_x() -> TestContext {
+        let mut tc = TestContext::new();
         let decls = vec![Decl::VarDecl {
-            name: "x".to_string(),
+            name: tc.x,
             val: Expr::Literal {
                 val: Value::Number { val: 0 },
             },
         }];
-        manager
-            .create_service("foo".to_string(), decls)
-            .await
-            .unwrap();
-        manager
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
+        tc
     }
 
-    fn x_state(manager: &Manager) -> &VarState {
-        manager.services.get("foo").unwrap().vars.get("x").unwrap()
+    fn x_state(tc: &TestContext) -> &VarState {
+        tc.manager
+            .services
+            .get(&tc.foo)
+            .unwrap()
+            .vars
+            .get(&tc.x)
+            .unwrap()
     }
 
-    fn assert_x_unlocked(manager: &Manager) {
+    fn assert_x_unlocked(tc: &TestContext) {
         assert!(matches!(
-            &x_state(manager).lock,
+            &x_state(tc).lock,
             crate::runtime::txn::VarLock::Unlocked
         ));
     }
 
-    // x = x + 1 reads x (read lock) then writes x (must upgrade to write lock).
-    // This is the read-then-write pattern that the old upfront analysis mishandled.
     #[tokio::test]
     async fn test_txn_read_then_write_upgrades_lock() {
-        let mut manager = manager_with_x().await;
+        // `x = x + 1` reads `x` (read lock) then writes `x` (must upgrade
+        // to write lock)
+        // This is the read-then-write pattern that the old upfront
+        // analysis mishandled
+        let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "x".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: tc.x }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Number { val: 1 },
                 }),
             },
         }];
-        manager.execute_action("foo", &stmts).await.unwrap();
-        let result = manager.lookup("x", "foo", None).await.unwrap();
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Number { val: 1 });
     }
 
-    // Locks must be released after a transaction, so a second transaction
-    // can acquire them. Running x = x + 1 twice should yield x == 2.
     #[tokio::test]
     async fn test_txn_locks_released_between_transactions() {
-        let mut manager = manager_with_x().await;
+        // Locks must be released after a transaction, so a second
+        // transaction can acquire them. Running `x = x + 1` twice
+        // should yield `x == 2`
+        let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "x".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: tc.x }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Number { val: 1 },
                 }),
             },
         }];
-        manager.execute_action("foo", &stmts).await.unwrap();
-        manager.execute_action("foo", &stmts).await.unwrap();
-        let result = manager.lookup("x", "foo", None).await.unwrap();
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         assert_eq!(result, Value::Number { val: 2 });
     }
 
-    // After a transaction completes, the variable's lock should be Unlocked.
     #[tokio::test]
     async fn test_txn_var_unlocked_after_commit() {
-        let mut manager = manager_with_x().await;
+        // After a transaction completes, the variable's lock should
+        // be `Unlocked`
+        let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Literal {
                 val: Value::Number { val: 42 },
             },
         }];
-        manager.execute_action("foo", &stmts).await.unwrap();
-        assert_x_unlocked(&manager);
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
+        assert_x_unlocked(&tc);
     }
 
-    // A successful transaction commits its buffered write and records the
-    // transaction as the latest writer for that variable.
     #[tokio::test]
     async fn test_txn_successful_write_updates_value_and_latest_write_txn() {
-        let mut manager = manager_with_x().await;
+        // A successful transaction commits its buffered write and records
+        // the transaction as the latest writer for that variable
+        let mut tc = manager_with_x().await;
         let stmts = vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Literal {
                 val: Value::Number { val: 42 },
             },
         }];
 
-        manager.execute_action("foo", &stmts).await.unwrap();
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
 
-        let state = x_state(&manager);
+        let state = x_state(&tc);
         assert_eq!(state.value, Value::Number { val: 42 });
         assert!(state.latest_write_txn.is_some());
     }
 
-    // A nested `do` (an action invoking another action) must reuse the same
-    // transaction, not start a fresh one. The inner write to x should commit and
-    // all locks should be released afterward. This guards the bug where nested
-    // execution clobbered the outer transaction's lock tracking.
     #[tokio::test]
     async fn test_txn_nested_do_reuses_transaction() {
-        let mut manager = manager_with_x().await;
-        // outer action: do (action { x = x + 1; });
+        // A nested `do` (an action invoking another action) must reuse
+        // the same transaction, not start a fresh one. The inner write
+        // to `x` should commit and all locks should be released afterward
+        // This guards the bug where nested execution clobbered the outer
+        // transaction's lock tracking
+        let mut tc = manager_with_x().await;
+        // outer action: `do` (action { `x` = `x` + 1 })
         let inner = Expr::Action(vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "x".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: tc.x }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Number { val: 1 },
                 }),
             },
         }]);
         let stmts = vec![ActionStmt::Do(inner)];
-        manager.execute_action("foo", &stmts).await.unwrap();
+        tc.manager.execute_action(tc.foo, &stmts).await.unwrap();
 
         // inner write took effect
-        let result = manager.lookup("x", "foo", None).await.unwrap();
-        assert_eq!(result, Value::Number { val: 1 });
+        let result = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         // and the lock was released
-        assert_x_unlocked(&manager);
+        assert_eq!(result, Value::Number { val: 1 });
+        assert_x_unlocked(&tc);
     }
 
-    // A transaction that fails partway must leave no partial writes: writes are
-    // buffered and applied only on a successful commit. Here the first statement
-    // writes x, the second fails (asserting false), so x must stay unchanged.
     #[tokio::test]
     async fn test_txn_failed_transaction_leaves_no_partial_writes() {
-        let mut manager = manager_with_x().await;
+        // A transaction that fails partway must leave no partial writes:
+        // writes are buffered and applied only on a successful commit
+        // Here the first statement writes `x`, the second fails
+        // (asserting `false`), so `x` must stay unchanged
+        let mut tc = manager_with_x().await;
         let stmts = vec![
             ActionStmt::Assign {
-                var: "x".to_string(),
+                name: tc.x,
                 expr: Expr::Literal {
                     val: Value::Number { val: 99 },
                 },
@@ -1495,36 +1690,37 @@ mod tests {
                 val: Value::Bool { val: false },
             }),
         ];
-        let result = manager.execute_action("foo", &stmts).await;
+        let result = tc.manager.execute_action(tc.foo, &stmts).await;
         assert!(result.is_err());
-        // x must remain 0 — the buffered write to 99 was never committed
-        let x = manager.lookup("x", "foo", None).await.unwrap();
-        assert_eq!(x, Value::Number { val: 0 });
+        // `x` must remain 0 — the buffered write to 99 was never committed
+        let x = tc.manager.lookup(tc.x, tc.foo, None).await.unwrap();
         // and the lock was released
-        assert_x_unlocked(&manager);
+        assert_eq!(x, Value::Number { val: 0 });
+        assert_x_unlocked(&tc);
     }
 
-    // A failed transaction must not update either committed state field: the
-    // value and latest writer should remain from the last successful commit.
     #[tokio::test]
     async fn test_txn_failed_transaction_preserves_previous_latest_write_txn() {
-        let mut manager = manager_with_x().await;
+        // A failed transaction must not update either committed state
+        // field: the value and latest writer should remain from the last
+        // successful commit
+        let mut tc = manager_with_x().await;
         let successful_write = vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Literal {
                 val: Value::Number { val: 1 },
             },
         }];
-        manager
-            .execute_action("foo", &successful_write)
+        tc.manager
+            .execute_action(tc.foo, &successful_write)
             .await
             .unwrap();
-        let previous_txn = x_state(&manager).latest_write_txn.clone();
+        let previous_txn = x_state(&tc).latest_write_txn.clone();
         assert!(previous_txn.is_some());
 
         let failing_write = vec![
             ActionStmt::Assign {
-                var: "x".to_string(),
+                name: tc.x,
                 expr: Expr::Literal {
                     val: Value::Number { val: 99 },
                 },
@@ -1534,62 +1730,60 @@ mod tests {
             }),
         ];
 
-        let result = manager.execute_action("foo", &failing_write).await;
+        let result = tc.manager.execute_action(tc.foo, &failing_write).await;
 
         assert!(result.is_err());
-        let state = x_state(&manager);
+        let state = x_state(&tc);
         assert_eq!(state.value, Value::Number { val: 1 });
         assert_eq!(state.latest_write_txn, previous_txn);
-        assert_x_unlocked(&manager);
+        assert_x_unlocked(&tc);
     }
 
-    // If a transaction fails after a read, its read lock must still be released.
     #[tokio::test]
     async fn test_txn_read_lock_released_after_failure() {
-        let mut manager = manager_with_x().await;
-        let stmts = vec![ActionStmt::Assert(Expr::Variable {
-            ident: "x".to_string(),
-        })];
+        // If a transaction fails after a read, its read lock must still
+        // be released
+        let mut tc = manager_with_x().await;
+        let stmts = vec![ActionStmt::Assert(Expr::Variable { name: tc.x })];
 
-        let result = manager.execute_action("foo", &stmts).await;
+        let result = tc.manager.execute_action(tc.foo, &stmts).await;
 
         assert!(result.is_err());
-        assert_eq!(x_state(&manager).value, Value::Number { val: 0 });
-        assert!(x_state(&manager).latest_write_txn.is_none());
-        assert_x_unlocked(&manager);
+        assert_eq!(x_state(&tc).value, Value::Number { val: 0 });
+        assert!(x_state(&tc).latest_write_txn.is_none());
+        assert_x_unlocked(&tc);
     }
 
-    // A transaction beginning in s1 composes an action defined in s2 (the
-    // example from issue #44). Both services' writes must commit under the one
-    // transaction, and the (service id, var) keying must keep them distinct.
     #[tokio::test]
     async fn test_txn_cross_service_composition() {
-        let mut manager = Manager::new();
-        // s2 owns w and an action that bumps it.
+        // A transaction beginning in `s1` composes an action defined in
+        // `s2` (the example from issue #44). Both services' writes must
+        // commit under the one transaction, and the `(service_net_id, var)`
+        // keying must keep them distinct
+        let mut tc = TestContext::new();
+        // s2 owns `w` and an action that bumps it
         let bump = Expr::Action(vec![ActionStmt::Assign {
-            var: "w".to_string(),
+            name: tc.w,
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "w".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: tc.w }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Number { val: 5 },
                 }),
             },
         }]);
-        manager
+        tc.manager
             .create_service(
-                "s2".to_string(),
+                tc.s2,
                 vec![
                     Decl::VarDecl {
-                        name: "w".to_string(),
+                        name: tc.w,
                         val: Expr::Literal {
                             val: Value::Number { val: 10 },
                         },
                     },
                     Decl::DefDecl {
-                        name: "bump".to_string(),
+                        name: tc.bump,
                         val: bump,
                         is_pub: true,
                     },
@@ -1597,12 +1791,12 @@ mod tests {
             )
             .await
             .unwrap();
-        // s1 owns x.
-        manager
+        // s1 owns `x`
+        tc.manager
             .create_service(
-                "s1".to_string(),
+                tc.s1,
                 vec![Decl::VarDecl {
-                    name: "x".to_string(),
+                    name: tc.x,
                     val: Expr::Literal {
                         val: Value::Number { val: 0 },
                     },
@@ -1611,71 +1805,69 @@ mod tests {
             .await
             .unwrap();
 
-        // Transaction on s1: x = x + 1; do s2.bump;
+        // Transaction on `s1`: `x` = `x` + 1; `do` `s2.bump`
         let stmts = vec![
             ActionStmt::Assign {
-                var: "x".to_string(),
+                name: tc.x,
                 expr: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable {
-                        ident: "x".to_string(),
-                    }),
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Number { val: 1 },
                     }),
                 },
             },
             ActionStmt::Do(Expr::MemberAccess {
-                service: "s2".to_string(),
-                member: "bump".to_string(),
+                service_name: tc.s2,
+                member_name: tc.bump,
             }),
         ];
-        manager.execute_action("s1", &stmts).await.unwrap();
+        tc.manager.execute_action(tc.s1, &stmts).await.unwrap();
 
-        // Both services' writes committed.
+        // Both services' writes committed
         assert_eq!(
-            manager.lookup("x", "s1", None).await.unwrap(),
+            tc.manager.lookup(tc.x, tc.s1, None).await.unwrap(),
             Value::Number { val: 1 }
         );
         assert_eq!(
-            manager.lookup("w", "s2", None).await.unwrap(),
+            tc.manager.lookup(tc.w, tc.s2, None).await.unwrap(),
             Value::Number { val: 15 }
         );
-        // Locks released on both services.
+        // Locks released on both services
         assert!(matches!(
-            manager
+            tc.manager
                 .services
-                .get("s1")
+                .get(&tc.s1)
                 .unwrap()
                 .vars
-                .get("x")
+                .get(&tc.x)
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::Unlocked
         ));
         assert!(matches!(
-            manager
+            tc.manager
                 .services
-                .get("s2")
+                .get(&tc.s2)
                 .unwrap()
                 .vars
-                .get("w")
+                .get(&tc.w)
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::Unlocked
         ));
     }
 
-    // Wait-die: a younger transaction contending for a lock held by an older
-    // transaction dies (abort) rather than acquiring it.
     #[tokio::test]
     async fn test_wait_die_younger_dies_at_acquire() {
-        let mut manager = Manager::new();
-        manager
+        // Wait-die: a younger transaction contending for a lock held by
+        // an older transaction dies (abort) rather than acquiring it
+        let mut tc = TestContext::new();
+        tc.manager
             .create_service(
-                "s1".to_string(),
+                tc.s1,
                 vec![Decl::VarDecl {
-                    name: "x".to_string(),
+                    name: tc.x,
                     val: Expr::Literal {
                         val: Value::Number { val: 0 },
                     },
@@ -1688,12 +1880,12 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        manager
+        tc.manager
             .services
-            .get_mut("s1")
+            .get_mut(&tc.s1)
             .unwrap()
             .vars
-            .get_mut("x")
+            .get_mut(&tc.x)
             .unwrap()
             .lock = crate::runtime::txn::VarLock::WriteLocked(older);
         let younger = crate::runtime::txn::TxnId {
@@ -1701,21 +1893,22 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        let result = manager.acquire_write_lock("s1", "x", &younger);
+        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &younger);
         assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
     }
 
-    // Wait-die: an older transaction contending for a lock held by a younger
-    // transaction takes the wait path, surfaced as WaitOn carrying the
-    // contended (service, var) so the owner can park the request.
     #[tokio::test]
     async fn test_wait_die_older_takes_wait_path() {
-        let mut manager = Manager::new();
-        manager
+        // Wait-die: an older transaction contending for a lock held by
+        // a younger transaction takes the wait path, surfaced as
+        // `WaitOn` carrying the contended `(service, var)` so the owner
+        // can park the request
+        let mut tc = TestContext::new();
+        tc.manager
             .create_service(
-                "s1".to_string(),
+                tc.s1,
                 vec![Decl::VarDecl {
-                    name: "x".to_string(),
+                    name: tc.x,
                     val: Expr::Literal {
                         val: Value::Number { val: 0 },
                     },
@@ -1728,12 +1921,12 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        manager
+        tc.manager
             .services
-            .get_mut("s1")
+            .get_mut(&tc.s1)
             .unwrap()
             .vars
-            .get_mut("x")
+            .get_mut(&tc.x)
             .unwrap()
             .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
         let older = crate::runtime::txn::TxnId {
@@ -1741,21 +1934,18 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        let result = manager.acquire_write_lock("s1", "x", &older);
+        let result = tc.manager.acquire_write_lock(tc.s1, tc.x, &older);
         assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
     }
 
-    // Wait-die end to end: an action whose variable is held by an older
-    // transaction dies and retries, and after exhausting the bounded retries
-    // returns WaitDieAbort without disturbing the older holder's lock.
     #[tokio::test]
     async fn test_wait_die_action_dies_and_retries() {
-        let mut manager = Manager::new();
-        manager
+        let mut tc = TestContext::new();
+        tc.manager
             .create_service(
-                "s1".to_string(),
+                tc.s1,
                 vec![Decl::VarDecl {
-                    name: "x".to_string(),
+                    name: tc.x,
                     val: Expr::Literal {
                         val: Value::Number { val: 0 },
                     },
@@ -1768,59 +1958,58 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        manager
+        tc.manager
             .services
-            .get_mut("s1")
+            .get_mut(&tc.s1)
             .unwrap()
             .vars
-            .get_mut("x")
+            .get_mut(&tc.x)
             .unwrap()
             .lock = crate::runtime::txn::VarLock::WriteLocked(older);
         let stmts = vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "x".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: tc.x }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Number { val: 1 },
                 }),
             },
         }];
-        let result = manager.execute_action("s1", &stmts).await;
+        let result = tc.manager.execute_action(tc.s1, &stmts).await;
         assert!(matches!(result, Err(EvalError::WaitDieAbort(_))));
         assert!(matches!(
-            manager
+            tc.manager
                 .services
-                .get("s1")
+                .get(&tc.s1)
                 .unwrap()
                 .vars
-                .get("x")
+                .get(&tc.x)
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
     }
 
-    // Wait-die: a participant action that conflicts mid-execution parks by
-    // preserving its partial transaction (locks already taken stay held) in
-    // pending_txns, so a later re-dispatch can resume rather than restart.
     #[tokio::test]
     async fn test_wait_die_participant_preserves_partial_txn() {
-        let mut manager = Manager::new();
-        manager
+        // Wait-die: a participant action that conflicts mid-execution
+        // parks by preserving its partial transaction (locks already
+        // taken stay held) in `pending_txns`, so a later re-dispatch
+        // can resume rather than restart
+        let mut tc = TestContext::new();
+        tc.manager
             .create_service(
-                "s1".to_string(),
+                tc.s1,
                 vec![
                     Decl::VarDecl {
-                        name: "y".to_string(),
+                        name: tc.y,
                         val: Expr::Literal {
                             val: Value::Number { val: 0 },
                         },
                     },
                     Decl::VarDecl {
-                        name: "x".to_string(),
+                        name: tc.x,
                         val: Expr::Literal {
                             val: Value::Number { val: 0 },
                         },
@@ -1829,76 +2018,77 @@ mod tests {
             )
             .await
             .unwrap();
-        // A younger transaction holds a write lock on x.
+        // A younger transaction holds a write lock on `x`
         let younger = crate::runtime::txn::TxnId {
             timestamp: u128::MAX,
             node_id: 1,
             iteration: 0,
         };
-        manager
+        tc.manager
             .services
-            .get_mut("s1")
+            .get_mut(&tc.s1)
             .unwrap()
             .vars
-            .get_mut("x")
+            .get_mut(&tc.x)
             .unwrap()
             .lock = crate::runtime::txn::VarLock::WriteLocked(younger);
-        // Older transaction: write y (acquires y), then touch x (conflict, waits).
         let older = crate::runtime::txn::TxnId {
             timestamp: 1,
             node_id: 1,
             iteration: 0,
         };
+        // Older transaction: write `y` (acquires `y`), then touch `x`
+        // (conflict, waits)
         let stmts = vec![
             ActionStmt::Assign {
-                var: "y".to_string(),
+                name: tc.y,
                 expr: Expr::Literal {
                     val: Value::Number { val: 5 },
                 },
             },
             ActionStmt::Assign {
-                var: "x".to_string(),
+                name: tc.x,
                 expr: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable {
-                        ident: "x".to_string(),
-                    }),
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
                     expr2: Box::new(Expr::Literal {
                         val: Value::Number { val: 1 },
                     }),
                 },
             },
         ];
-        let result = manager
-            .execute_action_participant("s1", &stmts, &[], older.clone())
+        let result = tc
+            .manager
+            .execute_action_participant(tc.s1, &stmts, &[], older.clone())
             .await;
-        // Parked: returns WaitOn, and the partial transaction is preserved.
+        // Parked: returns `WaitOn`, and the partial transaction is preserved
         assert!(matches!(result, Err(EvalError::WaitOn(_, _))));
-        assert!(manager.pending_txns.contains_key(&older));
-        // The lock it already took on y is still held (not released on park).
+        assert!(tc.manager.pending_txns.contains_key(&older));
+        // The lock it already took on `y` is still held (not released on park)
         assert!(matches!(
-            manager
+            tc.manager
                 .services
-                .get("s1")
+                .get(&tc.s1)
                 .unwrap()
                 .vars
-                .get("y")
+                .get(&tc.y)
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
     }
 
-    // Wait-die: parked requests on a variable are served oldest-first when the
-    // lock frees, and a transaction's waiters are purged when it aborts.
     #[tokio::test]
     async fn test_wait_queue_oldest_first_and_purge() {
-        let mut manager = Manager::new();
-        manager
+        // Wait-die: parked requests on a variable are served oldest-first
+        // when the lock frees, and a transaction's waiters are purged
+        // when it aborts
+        let mut tc = TestContext::new();
+        tc.manager
             .create_service(
-                "s1".to_string(),
+                tc.s1,
                 vec![Decl::VarDecl {
-                    name: "x".to_string(),
+                    name: tc.x,
                     val: Expr::Literal {
                         val: Value::Number { val: 0 },
                     },
@@ -1909,7 +2099,7 @@ mod tests {
         let make = |rid: u64, tid: crate::runtime::txn::TxnId| ParkedRequest::Action {
             request_id: rid,
             reply_to: String::new(),
-            service: "s1".to_string(),
+            service: tc.s1,
             stmts: vec![],
             env: vec![],
             tid,
@@ -1924,32 +2114,33 @@ mod tests {
             node_id: 1,
             iteration: 0,
         };
-        manager.park_request("s1", "x".to_string(), make(1, mid.clone()));
-        manager.park_request("s1", "x".to_string(), make(2, old.clone()));
-        // Freeing x yields the oldest waiter first; the other stays parked.
+        tc.manager.park_request(tc.s1, tc.x, make(1, mid.clone()));
+        tc.manager.park_request(tc.s1, tc.x, make(2, old.clone()));
+        // Freeing `x` yields the oldest waiter first; the other stays parked
         let mut freed = std::collections::HashSet::new();
-        freed.insert((manager.id_for_service("s1"), "x".to_string()));
-        let ready = manager.take_ready_waiters(&freed);
+        freed.insert((tc.manager.service_net_id_for_name(tc.s1), tc.x));
+        let ready = tc.manager.take_ready_waiters(&freed);
         assert_eq!(ready.len(), 1);
         assert!(ready[0].tid() == &old);
-        // The remaining (mid) waiter is purged when its transaction aborts.
-        let removed = manager.purge_parked_txn(&mid);
+        // The remaining `mid` waiter is purged when its transaction aborts
+        let removed = tc.manager.purge_parked_txn(&mid);
         assert_eq!(removed.len(), 1);
-        assert!(manager.wait_queue.is_empty());
+        assert!(tc.manager.wait_queue.is_empty());
     }
 
-    // Wait-die end to end (single node, no network): an older transaction parks
-    // on a variable held by a younger one; when the younger aborts and frees the
-    // lock, the parked request is taken oldest-first and its re-run resumes from
-    // the preserved transaction and now succeeds.
     #[tokio::test]
     async fn test_wait_die_parked_request_resumes_after_release() {
-        let mut manager = Manager::new();
-        manager
+        // Wait-die end to end (single node, no network): an older
+        // transaction parks on a variable held by a younger one; when
+        // the younger aborts and frees the lock, the parked request is
+        // taken oldest-first and its re-run resumes from the preserved
+        // transaction and now succeeds
+        let mut tc = TestContext::new();
+        tc.manager
             .create_service(
-                "s1".to_string(),
+                tc.s1,
                 vec![Decl::VarDecl {
-                    name: "x".to_string(),
+                    name: tc.x,
                     val: Expr::Literal {
                         val: Value::Number { val: 0 },
                     },
@@ -1958,77 +2149,77 @@ mod tests {
             .await
             .unwrap();
 
-        // A younger transaction holds a write lock on x, prepared in pending_txns.
+        // A younger transaction holds a write lock on `x`, prepared in
+        // `pending_txns`
         let younger = crate::runtime::txn::TxnId {
             timestamp: u128::MAX,
             node_id: 1,
             iteration: 0,
         };
-        manager
+        tc.manager
             .services
-            .get_mut("s1")
+            .get_mut(&tc.s1)
             .unwrap()
             .vars
-            .get_mut("x")
+            .get_mut(&tc.x)
             .unwrap()
             .lock = crate::runtime::txn::VarLock::WriteLocked(younger.clone());
         let mut younger_txn = crate::runtime::txn::Transaction::new(younger.clone());
         younger_txn
             .locked
-            .insert((manager.id_for_service("s1"), "x".to_string()));
-        manager.pending_txns.insert(younger.clone(), younger_txn);
+            .insert((tc.manager.service_net_id_for_name(tc.s1), tc.x));
+        tc.manager.pending_txns.insert(younger.clone(), younger_txn);
 
-        // Older transaction: x = x + 1 conflicts -> WaitOn -> park it.
         let older = crate::runtime::txn::TxnId {
             timestamp: 1,
             node_id: 1,
             iteration: 0,
         };
+        // Older transaction: `x` = `x` + 1 conflicts -> `WaitOn` -> park it
         let stmts = vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: tc.x,
             expr: Expr::Binop {
                 op: crate::ast::BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "x".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: tc.x }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Number { val: 1 },
                 }),
             },
         }];
-        let r1 = manager
-            .execute_action_participant("s1", &stmts, &[], older.clone())
+        let r1 = tc
+            .manager
+            .execute_action_participant(tc.s1, &stmts, &[], older.clone())
             .await;
         assert!(matches!(r1, Err(EvalError::WaitOn(_, _))));
-        manager.park_request(
-            "s1",
-            "x".to_string(),
+        tc.manager.park_request(
+            tc.s1,
+            tc.x,
             ParkedRequest::Action {
                 request_id: 1,
                 reply_to: String::new(),
-                service: "s1".to_string(),
+                service: tc.s1,
                 stmts: stmts.clone(),
                 env: vec![],
                 tid: older.clone(),
             },
         );
 
-        // The younger holder aborts, freeing x.
-        let freed = manager.abort_participant(&younger).await;
+        // The younger holder aborts, freeing `x`
+        let freed = tc.manager.abort_participant(&younger).await;
         assert!(matches!(
-            manager
+            tc.manager
                 .services
-                .get("s1")
+                .get(&tc.s1)
                 .unwrap()
                 .vars
-                .get("x")
+                .get(&tc.x)
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::Unlocked
         ));
 
-        // Wake: take the oldest waiter and re-run it; it should now succeed.
-        let ready = manager.take_ready_waiters(&freed);
+        // Wake: take the oldest waiter and re-run it; it should now succeed
+        let ready = tc.manager.take_ready_waiters(&freed);
         assert_eq!(ready.len(), 1);
         if let ParkedRequest::Action {
             service,
@@ -2038,26 +2229,27 @@ mod tests {
             ..
         } = &ready[0]
         {
-            let r2 = manager
-                .execute_action_participant(service, stmts, env, tid.clone())
+            let r2 = tc
+                .manager
+                .execute_action_participant(*service, stmts, env, tid.clone())
                 .await;
             assert!(r2.is_ok());
         } else {
             panic!("expected an Action waiter");
         }
 
-        // The older transaction now holds x's write lock and is prepared.
+        // The older transaction now holds `x`'s write lock and is prepared
         assert!(matches!(
-            manager
+            tc.manager
                 .services
-                .get("s1")
+                .get(&tc.s1)
                 .unwrap()
                 .vars
-                .get("x")
+                .get(&tc.x)
                 .unwrap()
                 .lock,
             crate::runtime::txn::VarLock::WriteLocked(_)
         ));
-        assert!(manager.pending_txns.contains_key(&older));
+        assert!(tc.manager.pending_txns.contains_key(&older));
     }
 }

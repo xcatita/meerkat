@@ -1,54 +1,68 @@
 use crate::ast::{BinOp, Expr, UnOp, Value};
-use crate::runtime::manager::Manager;
+use crate::runtime::interner::Symbol;
 use crate::runtime::txn::Transaction;
+use crate::runtime::Manager;
 use std::collections::HashSet;
 
 #[derive(Debug)]
 pub enum EvalError {
     TypeError(String),
-    NetworkError(String),
-    LookupError(String),
+    VarNotFound(String),
+    ServiceNotFound(String),
+    LocalDispatchFailed(String),
+    RemoteDispatchFailed(String),
     NotImplemented,
-    LockConflict(String),
-    /// A transaction lost a wait-die contest (an older transaction holds the
-    /// lock) and must abort and retry with a higher iteration.
     WaitDieAbort(String),
-    /// Wait-die wait: the requester is older than the current holder and should
-    /// wait for the lock to free. Carries the contended (service, var) so the
-    /// owner can park the request on that variable's wait queue.
-    WaitOn(String, String),
+    WaitOn(Symbol, Symbol),
 }
 
+/// Implement the `Display` trait for the `EvalError` type
+///
+/// This prints user-facing descriptions of evaluator errors
 impl std::fmt::Display for EvalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    /// Format the evaluation error for display
+    ///
+    /// Args:
+    ///     `f` (`&mut std::fmt::Formatter<'_>`): The formatter target
+    ///
+    /// Returns:
+    ///     `std::fmt::Result`: The result of the formatting operation
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EvalError::TypeError(s) => write!(f, "Type error: {}", s),
-            EvalError::NetworkError(s) => write!(f, "Network error: {}", s),
-            EvalError::LookupError(s) => write!(f, "Lookup error: {}", s),
-            EvalError::NotImplemented => write!(f, "Not yet implemented"),
-            EvalError::LockConflict(s) => write!(f, "Lock conflict: {}", s),
+            EvalError::VarNotFound(s) => write!(f, "Variable not found: {}", s),
+            EvalError::ServiceNotFound(s) => write!(f, "Service not found: {}", s),
+            EvalError::LocalDispatchFailed(s) => write!(f, "Local dispatch failed: {}", s),
+            EvalError::RemoteDispatchFailed(s) => write!(f, "Remote dispatch failed: {}", s),
+            EvalError::NotImplemented => write!(f, "Not implemented"),
             EvalError::WaitDieAbort(s) => write!(f, "Wait-die abort: {}", s),
-            EvalError::WaitOn(service, var) => write!(f, "Wait-die wait on {}::{}", service, var),
+            EvalError::WaitOn(service, var) => {
+                write!(f, "Wait-die wait on Symbol({})::Symbol({})", service, var)
+            }
         }
     }
 }
 
 impl std::error::Error for EvalError {}
 
-/// Evaluation context: holds the stable execution state that doesn't
-/// change per call frame. Passed as &mut so manager can be updated.
-/// env is kept separate since it changes at each function call boundary.
+/// Evaluation context represented by `EvalContext`
+///
+/// Holds the stable execution state that does not change per call
+/// frame. Passed as `&mut` so the `manager` can be updated
+///
+/// The `env` parameter is kept separate since it changes at each
+/// function call boundary
 pub struct EvalContext<'a> {
     pub manager: &'a mut Manager,
-    pub service_name: &'a str,
-    /// Active transaction, if evaluation is happening inside one.
+    pub service_name: Symbol,
+    /// Active transaction if evaluation is happening inside one
     pub txn: Option<&'a mut Transaction>,
 }
 
 #[async_recursion::async_recursion]
 pub async fn eval(
     expr: &Expr,
-    env: &[(String, Value)],
+    env: &[(Symbol, Value)],
     ctx: &mut EvalContext<'_>,
 ) -> Result<Value, EvalError> {
     match expr {
@@ -69,14 +83,14 @@ pub async fn eval(
                 } => {
                     let mut new_env = closure_env.clone();
                     for (param, arg_val) in params.iter().zip(arg_vals) {
-                        new_env.push((param.clone(), arg_val));
+                        new_env.push((*param, arg_val));
                     }
                     eval(
                         &body,
                         &new_env,
                         &mut EvalContext {
                             manager: ctx.manager,
-                            service_name: &closure_svc,
+                            service_name: closure_svc,
                             txn: ctx.txn.as_deref_mut(),
                         },
                     )
@@ -88,14 +102,14 @@ pub async fn eval(
             }
         }
 
-        Expr::Variable { ident } => {
+        &Expr::Variable { name } => {
             for (var_name, var_val) in env.iter().rev() {
-                if var_name == ident {
+                if *var_name == name {
                     return Ok(var_val.clone());
                 }
             }
             ctx.manager
-                .lookup(ident, ctx.service_name, ctx.txn.as_deref_mut())
+                .lookup(name, ctx.service_name, ctx.txn.as_deref_mut())
                 .await
         }
 
@@ -159,20 +173,17 @@ pub async fn eval(
         }
 
         Expr::Func { params, body } => {
-            let var_binded: HashSet<String> = params.iter().cloned().collect();
+            let var_binded: HashSet<Symbol> = params.iter().cloned().collect();
             let free_vars = body.free_var(&HashSet::new(), &var_binded);
-            let captured_env: Vec<(String, Value)> = env
+            let captured_env: Vec<(Symbol, Value)> = env
                 .iter()
                 .filter(|(name, _)| {
                     free_vars.contains(name)
                         && !ctx
                             .manager
                             .services
-                            .get(ctx.service_name)
-                            .map(|s| {
-                                s.vars.contains_key(name.as_str())
-                                    || s.defs.contains_key(name.as_str())
-                            })
+                            .get(&ctx.service_name)
+                            .map(|s| s.vars.contains_key(name) || s.defs.contains_key(name))
                             .unwrap_or(false)
                 })
                 .cloned()
@@ -181,30 +192,29 @@ pub async fn eval(
                 params: params.clone(),
                 body: body.clone(),
                 env: captured_env,
-                service_name: ctx.service_name.to_string(),
+                service_name: ctx.service_name,
             })
         }
 
         Expr::Action(stmts) => {
-            // Use free_var on the Action expression itself to find free variables
-            // Service vars/defs are looked up fresh via the manager at execution time
+            // Use `free_var` on the `Action` expression itself to find
+            // free variables
+            // Service `vars` or `defs` are looked up fresh via the
+            // `manager` at execution time
             let action_expr = Expr::Action(stmts.clone());
             let free_vars = action_expr.free_var(
                 &std::collections::HashSet::new(),
                 &std::collections::HashSet::new(),
             );
-            let captured_env: Vec<(String, Value)> = env
+            let captured_env: Vec<(Symbol, Value)> = env
                 .iter()
                 .filter(|(name, _)| {
                     free_vars.contains(name)
                         && !ctx
                             .manager
                             .services
-                            .get(ctx.service_name)
-                            .map(|s| {
-                                s.vars.contains_key(name.as_str())
-                                    || s.defs.contains_key(name.as_str())
-                            })
+                            .get(&ctx.service_name)
+                            .map(|s| s.vars.contains_key(name) || s.defs.contains_key(name))
                             .unwrap_or(false)
                 })
                 .cloned()
@@ -212,35 +222,46 @@ pub async fn eval(
             Ok(Value::ActionClosure {
                 stmts: stmts.clone(),
                 env: captured_env,
-                // Stamp the action with its owning service's identity (which
-                // embeds this node's address), so it stays executable wherever
-                // the closure travels.
-                service: ctx.manager.id_for_service(ctx.service_name),
+                // Stamp the action with its owning service's identity
+                // (which embeds this node's address), so it stays
+                // executable wherever the `closure` travels
+                service_net_id: ctx.manager.service_net_id_for_name(ctx.service_name),
             })
         }
 
-        Expr::MemberAccess { service, member } => {
-            // Manager figures out whether service is local or remote
+        &Expr::MemberAccess {
+            service_name,
+            member_name,
+        } => {
+            // The `Manager` determines whether the service is local or
+            // remote
             ctx.manager
-                .lookup(member, service, ctx.txn.as_deref_mut())
+                .lookup(member_name, service_name, ctx.txn.as_deref_mut())
                 .await
         }
-        _ => Err(EvalError::NotImplemented),
+        Expr::Tuple { .. }
+        | Expr::KeyVal { .. }
+        | Expr::Select { .. }
+        | Expr::Table { .. }
+        | Expr::Fold { .. } => Err(EvalError::NotImplemented),
     }
 }
 
+/// Unit tests for the evaluator
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ast::{ActionStmt, BinOp, Expr, Value};
+    use crate::runtime::interner::Interner;
     use crate::runtime::Manager;
 
+    /// Verify that evaluating a literal expression returns the expected runtime `Value`
     #[tokio::test]
     async fn test_literal() {
-        let mut manager = Manager::default();
+        let mut manager = Manager::new(Interner::new());
         let mut ctx = EvalContext {
             manager: &mut manager,
-            service_name: "",
+            service_name: Symbol::empty(),
             txn: None,
         };
         let expr = Expr::Literal {
@@ -250,12 +271,13 @@ mod tests {
         assert_eq!(result, Value::Number { val: 42 });
     }
 
+    /// Verify that evaluating a binary add operation returns the sum of the numbers
     #[tokio::test]
     async fn test_binop_add() {
-        let mut manager = Manager::default();
+        let mut manager = Manager::new(Interner::new());
         let mut ctx = EvalContext {
             manager: &mut manager,
-            service_name: "",
+            service_name: Symbol::empty(),
             txn: None,
         };
         let expr = Expr::Binop {
@@ -271,21 +293,21 @@ mod tests {
         assert_eq!(result, Value::Number { val: 5 });
     }
 
+    /// Verify that defining a function and calling it yields the expected computed `Value`
     #[tokio::test]
     async fn test_func_and_call() {
-        let mut manager = Manager::default();
+        let mut manager = Manager::new(Interner::new());
+        let x = manager.interner.insert("x");
         let mut ctx = EvalContext {
             manager: &mut manager,
-            service_name: "",
+            service_name: Symbol::empty(),
             txn: None,
         };
         let func_expr = Expr::Func {
-            params: vec!["x".to_string()],
+            params: vec![x],
             body: Box::new(Expr::Binop {
                 op: BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "x".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: x }),
                 expr2: Box::new(Expr::Literal {
                     val: Value::Number { val: 10 },
                 }),
@@ -301,16 +323,18 @@ mod tests {
         assert_eq!(result, Value::Number { val: 15 });
     }
 
+    /// Verify that evaluating an action statement block produces an action `Value::ActionClosure`
     #[tokio::test]
     async fn test_action_creation() {
-        let mut manager = Manager::default();
+        let mut manager = Manager::new(Interner::new());
+        let var_name = manager.interner.insert("var_name");
         let mut ctx = EvalContext {
             manager: &mut manager,
-            service_name: "",
+            service_name: Symbol::empty(),
             txn: None,
         };
         let action_expr = Expr::Action(vec![ActionStmt::Assign {
-            var: "x".to_string(),
+            name: var_name,
             expr: Expr::Literal {
                 val: Value::Number { val: 5 },
             },
@@ -322,29 +346,30 @@ mod tests {
         }
     }
 
+    /// Verify that created `Value::Closure`s capture only their referenced free variables from the environment
     #[tokio::test]
     async fn test_closure_captures_only_free_vars() {
-        let mut manager = Manager::default();
+        let mut manager = Manager::new(Interner::new());
+        let v1 = manager.interner.insert("v1");
+        let v2 = manager.interner.insert("v2");
+        let v3 = manager.interner.insert("v3");
+        let v4 = manager.interner.insert("v4");
         let mut ctx = EvalContext {
             manager: &mut manager,
-            service_name: "",
+            service_name: Symbol::empty(),
             txn: None,
         };
         let env = vec![
-            ("a".to_string(), Value::Number { val: 1 }),
-            ("b".to_string(), Value::Number { val: 2 }),
-            ("c".to_string(), Value::Number { val: 3 }),
+            (v1, Value::Number { val: 1 }),
+            (v2, Value::Number { val: 2 }),
+            (v3, Value::Number { val: 3 }),
         ];
         let func_expr = Expr::Func {
-            params: vec!["x".to_string()],
+            params: vec![v4],
             body: Box::new(Expr::Binop {
                 op: BinOp::Add,
-                expr1: Box::new(Expr::Variable {
-                    ident: "x".to_string(),
-                }),
-                expr2: Box::new(Expr::Variable {
-                    ident: "a".to_string(),
-                }),
+                expr1: Box::new(Expr::Variable { name: v4 }),
+                expr2: Box::new(Expr::Variable { name: v1 }),
             }),
         };
         let result = eval(&func_expr, &env, &mut ctx).await.unwrap();
@@ -357,7 +382,7 @@ mod tests {
             } => {
                 assert_eq!(params.len(), 1);
                 assert_eq!(captured_env.len(), 1);
-                assert_eq!(captured_env[0].0, "a");
+                assert_eq!(captured_env[0].0, v1);
                 assert_eq!(captured_env[0].1, Value::Number { val: 1 });
             }
             _ => panic!("Expected Closure"),
