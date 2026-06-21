@@ -2312,56 +2312,56 @@ mod tests {
     }
     #[tokio::test]
     async fn test_create_service_uses_single_transaction() {
-        let mut manager = Manager::new();
+        let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: "x".into(),
+                name: tc.x,
                 val: Expr::Literal {
                     val: Value::Number { val: 1 },
                 },
             },
             Decl::VarDecl {
-                name: "y".into(),
+                name: tc.y,
                 val: Expr::Literal {
                     val: Value::Number { val: 2 },
                 },
             },
             Decl::DefDecl {
-                name: "f".into(),
+                name: tc.f,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
-                    expr1: Box::new(Expr::Variable { ident: "x".into() }),
-                    expr2: Box::new(Expr::Variable { ident: "y".into() }),
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Variable { name: tc.y }),
                 },
                 is_pub: true,
             },
         ];
-        manager.create_service("foo".into(), decls).await.unwrap();
+        tc.manager.create_service(tc.f, decls).await.unwrap();
 
-        let foo = manager.services.get("foo").unwrap();
-        let tid = foo.vars.get("x").unwrap().latest_write_txn.clone();
+        let foo = tc.manager.services.get(&tc.foo).unwrap();
+        let tid = foo.vars.get(&tc.x).unwrap().latest_write_txn.clone();
         assert!(
             tid.is_some(),
             "init writes must record a writer txn from create_service"
         );
         // every var/def initialized by the same transaction
-        assert_eq!(foo.vars.get("y").unwrap().latest_write_txn, tid);
-        assert_eq!(foo.vars.get("f").unwrap().latest_write_txn, tid);
+        assert_eq!(foo.vars.get(&tc.y).unwrap().latest_write_txn, tid);
+        assert_eq!(foo.vars.get(&tc.f).unwrap().latest_write_txn, tid);
     }
 
     #[tokio::test]
     async fn test_create_service_rolls_back_on_partial_failure() {
-        let mut manager = Manager::new();
+        let mut tc = TestContext::new();
         let decls = vec![
             Decl::VarDecl {
-                name: "x".to_string(),
+                name: tc.x,
                 val: Expr::Literal {
                     val: Value::Number { val: 1 },
                 },
             },
             // adding a bool and number should be a type error
             Decl::VarDecl {
-                name: "y".to_string(),
+                name: tc.y,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
                     expr1: Box::new(Expr::Literal {
@@ -2373,10 +2373,10 @@ mod tests {
                 },
             },
         ];
-        let result = manager.create_service("foo".into(), decls).await;
+        let result = tc.manager.create_service(tc.foo, decls).await;
         assert!(result.is_err());
         assert!(
-            manager.services.is_empty(),
+            tc.manager.services.is_empty(),
             "no services should've been created"
         );
     }
@@ -2385,12 +2385,12 @@ mod tests {
     // in the sense that a lock is truly acquired, so I had Claude write a test for me
     #[tokio::test]
     async fn test_create_service_read_conflicts_under_one_txn() {
-        let mut manager = Manager::new();
-        manager
+        let mut tc = TestContext::new();
+        tc.manager
             .create_service(
-                "s1".into(),
+                tc.s1,
                 vec![Decl::VarDecl {
-                    name: "x".into(),
+                    name: tc.x,
                     val: Expr::Literal {
                         val: Value::Number { val: 7 },
                     },
@@ -2400,26 +2400,28 @@ mod tests {
             .unwrap();
 
         // Simulate another in-flight transaction holding a write lock on s1.x.
-        let ext = TxnId::new(manager.node_id);
-        assert!(manager
+        let ext = TxnId::new(tc.manager.node_id);
+        assert!(tc
+            .manager
             .services
-            .get_mut("s1")
+            .get_mut(&tc.s1)
             .unwrap()
             .vars
-            .get_mut("x")
+            .get_mut(&tc.x)
             .unwrap()
             .lock
             .try_write(&ext));
 
         // s2's init reads s1.x; under a real transaction this must fail to read-lock.
-        let result = manager
+        let result = tc
+            .manager
             .create_service(
-                "s2".into(),
+                tc.s2,
                 vec![Decl::DefDecl {
-                    name: "f".into(),
+                    name: tc.f,
                     val: Expr::MemberAccess {
-                        service: "s1".into(),
-                        member: "x".into(),
+                        service_name: tc.s1,
+                        member_name: tc.x,
                     },
                     is_pub: true,
                 }],
@@ -2431,12 +2433,12 @@ mod tests {
             "init read must respect the lock"
         );
         assert!(
-            !manager.services.contains_key("s2"),
+            !tc.manager.services.contains_key(&tc.s2),
             "failed init rolls back"
         );
         // the foreign lock is untouched
         assert!(matches!(
-            manager.services.get("s1").unwrap().vars.get("x").unwrap().lock,
+            tc.manager.services.get(&tc.s1).unwrap().vars.get(&tc.x).unwrap().lock,
             crate::runtime::txn::VarLock::WriteLocked(ref t) if *t == ext
         ));
     }
