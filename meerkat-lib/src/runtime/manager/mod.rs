@@ -2336,7 +2336,7 @@ mod tests {
                 is_pub: true,
             },
         ];
-        tc.manager.create_service(tc.f, decls).await.unwrap();
+        tc.manager.create_service(tc.foo, decls).await.unwrap();
 
         let foo = tc.manager.services.get(&tc.foo).unwrap();
         let tid = foo.vars.get(&tc.x).unwrap().latest_write_txn.clone();
