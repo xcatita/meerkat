@@ -2332,18 +2332,21 @@ mod tests {
         let decls = vec![
             Decl::VarDecl {
                 name: tc.x,
+                ty: None,
                 val: Expr::Literal {
-                    val: Value::Number { val: 1 },
+                    val: Value::Int { val: 1 },
                 },
             },
             Decl::VarDecl {
                 name: tc.y,
+                ty: None,
                 val: Expr::Literal {
-                    val: Value::Number { val: 2 },
+                    val: Value::Int { val: 2 },
                 },
             },
             Decl::DefDecl {
                 name: tc.f,
+                ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
                     expr1: Box::new(Expr::Variable { name: tc.x }),
@@ -2371,20 +2374,22 @@ mod tests {
         let decls = vec![
             Decl::VarDecl {
                 name: tc.x,
+                ty: None,
                 val: Expr::Literal {
-                    val: Value::Number { val: 1 },
+                    val: Value::Int { val: 1 },
                 },
             },
             // adding a bool and number should be a type error
             Decl::VarDecl {
                 name: tc.y,
+                ty: None,
                 val: Expr::Binop {
                     op: crate::ast::BinOp::Add,
                     expr1: Box::new(Expr::Literal {
                         val: Value::Bool { val: true },
                     }),
                     expr2: Box::new(Expr::Literal {
-                        val: Value::Number { val: 1 },
+                        val: Value::Int { val: 1 },
                     }),
                 },
             },
@@ -2407,8 +2412,9 @@ mod tests {
                 tc.s1,
                 vec![Decl::VarDecl {
                     name: tc.x,
+                    ty: None,
                     val: Expr::Literal {
-                        val: Value::Number { val: 7 },
+                        val: Value::Int { val: 7 },
                     },
                 }],
             )
@@ -2436,6 +2442,7 @@ mod tests {
                 tc.s2,
                 vec![Decl::DefDecl {
                     name: tc.f,
+                    ty: None,
                     val: Expr::MemberAccess {
                         service_name: tc.s1,
                         member_name: tc.x,
