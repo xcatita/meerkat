@@ -603,6 +603,8 @@ async fn run_watch(
             .replace("0.0.0.0", &node_ip)
             .replace("127.0.0.1", &node_ip);
         manager.set_local_address(format!("{}/p2p/{}", addr_str, peer_id));
+    } else {
+        return Err("Failed to start network listener in watch mode".into());
     }
     manager.network = Some(net);
 

@@ -751,6 +751,18 @@ impl Manager {
         let listener_def_sym = self.interner.insert(&listener_def);
         let listener_id = ServiceNetId(listener_service.clone());
 
+        // Only register a subscription for a member that actually exists on this
+        // service. Without this guard, an unknown member from untrusted network
+        // input would permanently grow listeners, listener_addrs, and the
+        // interner with no-op subscriptions.
+        let member_exists = self
+            .services
+            .get(&service_sym)
+            .map(|s| s.vars.contains_key(&member_sym))
+            .unwrap_or(false);
+        if !member_exists {
+            return;
+        }
         if let Some(svc) = self.services.get_mut(&service_sym) {
             svc.listeners
                 .entry(member_sym)
