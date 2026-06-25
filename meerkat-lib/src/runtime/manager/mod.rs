@@ -97,6 +97,11 @@ pub struct Manager {
     /// #24: reply address for each remote listener, keyed by the listener's
     /// ServiceNetId, so the owner can route Updates back to it.
     pub listener_addrs: HashMap<ServiceNetId, String>,
+    /// #24: RequestUpdates/Update messages seen by the sync reply-router
+    /// (dispatch_network_events) while awaiting a reply. They carry no
+    /// request_id, so they are buffered here and drained in async context so a
+    /// reactive update arriving mid-wait is applied, not dropped.
+    pub pending_reactive: Vec<MeerkatMessage>,
 }
 
 impl Manager {
@@ -114,6 +119,7 @@ impl Manager {
             interner,
             reactive_cache: None,
             listener_addrs: HashMap::new(),
+            pending_reactive: Vec::new(),
         }
     }
 
@@ -839,6 +845,15 @@ impl Manager {
             let event = n.try_recv_event();
             match event {
                 Some(NetworkEvent::MessageReceived { msg, .. }) => {
+                    // #24: these carry no request_id and are not replies; buffer
+                    // them for async draining instead of dropping them here.
+                    if matches!(
+                        msg,
+                        MeerkatMessage::RequestUpdates { .. } | MeerkatMessage::Update { .. }
+                    ) {
+                        self.pending_reactive.push(msg);
+                        continue;
+                    }
                     let rid = match &msg {
                         MeerkatMessage::LookupResponse { request_id, .. } => Some(*request_id),
                         MeerkatMessage::LookupError { request_id, .. } => Some(*request_id),
@@ -873,6 +888,53 @@ impl Manager {
     }
 
     /// shared by remote_lookup and remote_action.
+    /// #24: handle any reactive messages the sync router buffered. Called in
+    /// async context (after each dispatch_network_events) so RequestUpdates and
+    /// Update arriving mid-wait are applied rather than lost.
+    async fn drain_pending_reactive(&mut self) {
+        while !self.pending_reactive.is_empty() {
+            let batch = std::mem::take(&mut self.pending_reactive);
+            for msg in batch {
+                match msg {
+                    MeerkatMessage::RequestUpdates {
+                        service,
+                        member,
+                        listener_service,
+                        listener_def,
+                        reply_to,
+                        ..
+                    } => {
+                        self.handle_request_updates(
+                            service,
+                            member,
+                            listener_service,
+                            listener_def,
+                            reply_to,
+                        )
+                        .await;
+                    }
+                    MeerkatMessage::Update {
+                        listener_service,
+                        listener_def,
+                        source_service,
+                        member,
+                        value,
+                    } => {
+                        self.handle_update(
+                            listener_service,
+                            listener_def,
+                            source_service,
+                            member,
+                            value,
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     async fn send_and_await_reply(
         &mut self,
         addr: Address,
@@ -900,6 +962,7 @@ impl Manager {
 
         loop {
             self.dispatch_network_events();
+            self.drain_pending_reactive().await;
             tokio::select! {
                 biased;
                 result = &mut rx => {
@@ -1985,6 +2048,81 @@ mod tests {
                 .get(&ServiceNetId("remote-s2-id".to_string()))
                 .map(|a| a.as_str()),
             Some("/ip4/1.2.3.4/tcp/9")
+        );
+    }
+
+    // #24: an Update buffered by the sync reply-router (because it carries no
+    // request_id) must still be applied when drained, not dropped. This is the
+    // dual-role case Copilot flagged: a node awaiting a reply receives an Update.
+    #[tokio::test]
+    async fn test_buffered_update_is_applied_on_drain() {
+        let mut tc = TestContext::new();
+        let z = tc.manager.interner.insert("z");
+
+        let s1_decls = vec![
+            Decl::VarDecl {
+                name: tc.x,
+                val: Expr::Literal {
+                    val: Value::Number { val: 1 },
+                },
+            },
+            Decl::DefDecl {
+                name: tc.y,
+                val: Expr::Binop {
+                    op: crate::ast::BinOp::Add,
+                    expr1: Box::new(Expr::Variable { name: tc.x }),
+                    expr2: Box::new(Expr::Literal {
+                        val: Value::Number { val: 1 },
+                    }),
+                },
+                is_pub: true,
+            },
+        ];
+        tc.manager.create_service(tc.s1, s1_decls).await.unwrap();
+
+        let s2_decls = vec![Decl::DefDecl {
+            name: z,
+            val: Expr::Binop {
+                op: crate::ast::BinOp::Add,
+                expr1: Box::new(Expr::MemberAccess {
+                    service_name: tc.s1,
+                    member_name: tc.y,
+                }),
+                expr2: Box::new(Expr::Literal {
+                    val: Value::Number { val: 2 },
+                }),
+            },
+            is_pub: true,
+        }];
+        tc.manager.create_service(tc.s2, s2_decls).await.unwrap();
+
+        let s2_id = tc.manager.services.get(&tc.s2).unwrap().id.0.clone();
+        let net_val =
+            codec::encode_value(&Value::Number { val: 10 }, &tc.manager.interner).unwrap();
+
+        // Simulate the router having buffered an Update (s1.y = 10) mid-wait.
+        tc.manager.pending_reactive.push(MeerkatMessage::Update {
+            listener_service: s2_id,
+            listener_def: "z".to_string(),
+            source_service: "s1".to_string(),
+            member: "y".to_string(),
+            value: net_val,
+        });
+
+        // Draining must apply it: z recomputes from the cached 10 -> 10 + 2 = 12.
+        tc.manager.drain_pending_reactive().await;
+
+        assert!(tc.manager.pending_reactive.is_empty());
+        assert_eq!(
+            tc.manager
+                .services
+                .get(&tc.s2)
+                .unwrap()
+                .vars
+                .get(&z)
+                .unwrap()
+                .value,
+            Value::Number { val: 12 }
         );
     }
 
