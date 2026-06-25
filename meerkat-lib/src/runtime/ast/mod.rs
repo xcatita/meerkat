@@ -95,6 +95,11 @@ pub enum Value {
         body: Box<Expr>,
         env: Vec<(Symbol, Value)>,
         service_name: Symbol,
+        /// Important: `None` indicates missing type info, not the
+        /// `unit` type. In practice, return types for closures should
+        /// generally be `Some` type; however, this was left as an
+        /// `Option` for now for maximum flexibility as development
+        /// continues
         return_ty: Option<Type>,
     },
     ActionClosure {
@@ -145,6 +150,11 @@ pub enum Expr {
     Func {
         params: Vec<Param>,
         body: Box<Expr>,
+        /// Important: `None` indicates missing type info, not the
+        /// `unit` type. In practice, return types for closures should
+        /// generally be `Some` type; however, this was left as an
+        /// `Option` for now for maximum flexibility as development
+        /// continues
         return_ty: Option<Type>,
     },
     Call {

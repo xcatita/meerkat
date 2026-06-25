@@ -170,13 +170,17 @@ SimpleType: Type = {
     "string" => Type::String,
     "bool" => Type::Bool,
     "unit" => Type::Unit,
-    "(" <t:Type> <mut ts:("," <Type>)*> ")" => {
+    "(" <t:Type> <mut ts:("," <Type>)*> ")" =>? {
         if ts.is_empty() {
-            t
+            Ok(t)
         } else {
             let mut v = vec![t];
             v.append(&mut ts);
-            Type::Tuple(TupleType::new(v).unwrap())
+            TupleType::new(v)
+                .map(Type::Tuple)
+                .map_err(|e| ParseError::User {
+                    error: e.to_string(),
+                })
         }
     }
 }
@@ -326,9 +330,12 @@ Expr: Expr = {
     },
 
     #[precedence(level="8")] #[assoc(side="left")]
-    "fn" <params:Params> "=>" <e:Expr> => 
-    Expr::Func {
-        params, body: Box::new(e), return_ty: None
+    "fn" <params:Params> "=>" <e:Expr> => {
+        // The `return_ty` is set to `None` here because return types
+        // are inferred by a later pass instead of being parsed
+        Expr::Func {
+            params, body: Box::new(e), return_ty: None
+        }
     },
     "select" <mut cols: (<Ident> ",")*> <c: Ident?> "from" <t: Ident> "where" <cond: Expr> => Expr::Select {
         table_name: t,

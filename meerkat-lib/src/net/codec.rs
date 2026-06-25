@@ -57,9 +57,7 @@ fn encode_type_internal(ty: &Type, depth: usize) -> Result<NetType> {
         Type::Bool => Ok(NetType::Bool),
         Type::Unit => Ok(NetType::Unit),
         Type::Tuple(ts) => {
-            if ts.len() < 2 {
-                return Err(Error::Message(format!("invalid tuple arity: {}", ts.len())));
-            }
+            debug_assert!(ts.len() >= 2);
             let mut encoded_ts = Vec::new();
             for t in ts.iter() {
                 encoded_ts.push(encode_type_internal(t, depth + 1)?);
@@ -167,10 +165,7 @@ pub fn decode_type(ty: NetType) -> Result<Type> {
 pub fn encode_param(param: &Param, interner: &Interner) -> Result<NetParam> {
     let name_str = interner.get(param.name);
     validate_identifier(name_str)?;
-    let ty = match &param.ty {
-        Some(t) => Some(encode_type(t)?),
-        None => None,
-    };
+    let ty = param.ty.as_ref().map(encode_type).transpose()?;
     Ok(NetParam {
         name: name_str.to_string(),
         ty,
@@ -188,10 +183,7 @@ pub fn encode_param(param: &Param, interner: &Interner) -> Result<NetParam> {
 ///     `Result<Param>`: The decoded runtime parameter
 pub fn decode_param(param: NetParam, interner: &mut Interner) -> Result<Param> {
     validate_identifier(&param.name)?;
-    let ty = match param.ty {
-        Some(t) => Some(decode_type(t)?),
-        None => None,
-    };
+    let ty = param.ty.map(decode_type).transpose()?;
     Ok(Param {
         name: interner.insert(&param.name),
         ty,
@@ -234,10 +226,7 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
             }
             let service_str = interner.get(*service_name);
             validate_identifier(service_str)?;
-            let encoded_return_ty = match return_ty {
-                Some(t) => Some(encode_type(t)?),
-                None => None,
-            };
+            let encoded_return_ty = return_ty.as_ref().map(encode_type).transpose()?;
             Ok(NetValue::Closure {
                 params: encoded_params,
                 body: encoded_body,
@@ -305,10 +294,7 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
             }
             validate_identifier(&service_name)?;
             let decoded_service = interner.insert(&service_name);
-            let decoded_return_ty = match return_ty {
-                Some(t) => Some(decode_type(t)?),
-                None => None,
-            };
+            let decoded_return_ty = return_ty.map(decode_type).transpose()?;
             Ok(Value::Closure {
                 params: decoded_params,
                 body: decoded_body,
@@ -399,10 +385,7 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
                 encoded_params.push(encode_param(p, interner)?);
             }
             let encoded_body = Box::new(encode_expr(body, interner)?);
-            let encoded_return_ty = match return_ty {
-                Some(t) => Some(encode_type(t)?),
-                None => None,
-            };
+            let encoded_return_ty = return_ty.as_ref().map(encode_type).transpose()?;
             Ok(NetExpr::Func {
                 params: encoded_params,
                 body: encoded_body,
@@ -550,10 +533,7 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
                 decoded_params.push(decode_param(p, interner)?);
             }
             let decoded_body = Box::new(decode_expr(*body, interner)?);
-            let decoded_return_ty = match return_ty {
-                Some(t) => Some(decode_type(t)?),
-                None => None,
-            };
+            let decoded_return_ty = return_ty.map(decode_type).transpose()?;
             Ok(Expr::Func {
                 params: decoded_params,
                 body: decoded_body,
@@ -654,10 +634,7 @@ pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> Result<NetA
         ActionStmt::Let { name, ty, expr } => {
             let name_str = interner.get(*name);
             validate_identifier(name_str)?;
-            let encoded_ty = match ty {
-                Some(t) => Some(encode_type(t)?),
-                None => None,
-            };
+            let encoded_ty = ty.as_ref().map(encode_type).transpose()?;
             Ok(NetActionStmt::Let {
                 name: name_str.to_string(),
                 ty: encoded_ty,
@@ -704,10 +681,7 @@ pub fn decode_action_stmt(stmt: NetActionStmt, interner: &mut Interner) -> Resul
     match stmt {
         NetActionStmt::Let { name, ty, expr } => {
             validate_identifier(&name)?;
-            let decoded_ty = match ty {
-                Some(t) => Some(decode_type(t)?),
-                None => None,
-            };
+            let decoded_ty = ty.map(decode_type).transpose()?;
             Ok(ActionStmt::Let {
                 name: interner.insert(&name),
                 ty: decoded_ty,
