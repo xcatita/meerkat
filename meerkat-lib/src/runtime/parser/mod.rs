@@ -32,9 +32,12 @@ use logos::Logos;
 ///
 /// Returns:
 ///     `Result<Vec<Stmt>, String>`: The parsed statements, or an error string
-pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, String> {
+/// #39: Lex `src` into a token stream, enforcing the identifier and string
+/// literal length limits. Shared by the top-level parse paths and html
+/// interpolation parsing so the checks cannot drift out of sync.
+fn build_validated_lex_stream(src: &str) -> Result<Vec<(usize, lex::Token<'_>, usize)>, String> {
     let mut lex_stream = Vec::new();
-    for (t, span) in lex::Token::lexer(input).spanned() {
+    for (t, span) in lex::Token::lexer(src).spanned() {
         match t {
             lex::Token::Ident(name) if name.len() > MAX_IDENTIFIER_LENGTH => {
                 return Err(format!(
@@ -52,6 +55,11 @@ pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, S
         }
         lex_stream.push((span.start, t, span.end));
     }
+    Ok(lex_stream)
+}
+
+pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, String> {
+    let lex_stream = build_validated_lex_stream(input)?;
 
     meerkat::ProgParser::new()
         .parse(input, interner, lex_stream)
@@ -187,25 +195,7 @@ pub fn parse_template(
 /// The identifier and string-literal length limits enforced by the top-level
 /// parser are applied here too, so interpolations cannot bypass those limits.
 fn parse_expr_fragment(src: &str, interner: &mut Interner) -> Result<crate::ast::Expr, String> {
-    let mut lex_stream = Vec::new();
-    for (t, span) in lex::Token::lexer(src).spanned() {
-        match t {
-            lex::Token::Ident(name) if name.len() > MAX_IDENTIFIER_LENGTH => {
-                return Err(format!(
-                    "Parse error: identifier exceeds maximum length of {} characters",
-                    MAX_IDENTIFIER_LENGTH
-                ));
-            }
-            lex::Token::StrLit(val) if val.len() > MAX_STRING_LITERAL_LENGTH => {
-                return Err(format!(
-                    "Parse error: string literal exceeds maximum length of {} characters",
-                    MAX_STRING_LITERAL_LENGTH
-                ));
-            }
-            _ => {}
-        }
-        lex_stream.push((span.start, t, span.end));
-    }
+    let lex_stream = build_validated_lex_stream(src)?;
     meerkat::ExprParser::new()
         .parse(src, interner, lex_stream)
         .map_err(|e| format!("Parse error in html interpolation: {:?}", e))

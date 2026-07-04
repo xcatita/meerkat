@@ -230,8 +230,16 @@ impl<'a> AstPrinter<'a> {
             }
             Expr::Html(template) => {
                 println!("Html:");
-                for e in template.embedded_exprs() {
-                    self.print_expr(e, indent + 1);
+                for part in template.parts() {
+                    match part {
+                        crate::runtime::html::HtmlPartView::Text(t) => {
+                            self.print_indent(indent + 1);
+                            println!("Text: {:?}", t);
+                        }
+                        crate::runtime::html::HtmlPartView::Expr(e) => {
+                            self.print_expr(e, indent + 1)
+                        }
+                    }
                 }
             }
             Expr::Tuple { val } => {

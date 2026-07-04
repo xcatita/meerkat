@@ -83,6 +83,13 @@ pub(crate) enum HtmlPart {
 /// renaming), and render it through [`HtmlTemplate::render`]. This mirrors the
 /// [`Html`] value ADT and is the boundary at which HTML validation will later
 /// be added.
+/// A borrowed view of one part of an HTML template, for read-only traversal
+/// (e.g. the AST printer) without exposing the internal representation.
+pub enum HtmlPartView<'a> {
+    Text(&'a str),
+    Expr(&'a Expr),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HtmlTemplate {
     parts: Vec<HtmlPart>,
@@ -106,6 +113,17 @@ impl HtmlTemplate {
         self.parts.iter_mut().filter_map(|p| match p {
             HtmlPart::Text(_) => None,
             HtmlPart::Expr(e) => Some(e.as_mut()),
+        })
+    }
+
+    /// Iterate the template's parts in order, as borrowed views.
+    ///
+    /// Gives ordered access to literal text and embedded expressions (for the
+    /// AST printer) without exposing the internal `HtmlPart` representation.
+    pub fn parts(&self) -> impl Iterator<Item = HtmlPartView<'_>> {
+        self.parts.iter().map(|p| match p {
+            HtmlPart::Text(t) => HtmlPartView::Text(t),
+            HtmlPart::Expr(e) => HtmlPartView::Expr(e),
         })
     }
 
