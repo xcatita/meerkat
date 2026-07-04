@@ -6,11 +6,11 @@ The syntax for code updates should distinguish updating existing definitions
 from introducing new definitions.  One possibility would look like this
 (example borrowed from the Requirements wiki page):
 
-```
+```meerkat
 update s1 {
   update def y = x + 5;
 }
-```
+```meerkat
 
 ## Service classes
 
@@ -21,13 +21,13 @@ service class.  A service class is a template for instantiating services; the
 most common use case is web clients, but there could be others.  Possible
 syntax for service class definition and instantiation:
 
-```
+```meerkat
 service class MyServiceClass {
   ...
 }
 
 service myService = MyServiceClass;
-```
+```meerkat
 
 ## Typechecking
 
@@ -52,14 +52,14 @@ REPL at that node, `update` statements can be executed to update them.  If the
 node imports services from other nodes, it can also execute `update` statements
 on those imported services.
 
-When Meerkat supports a import statement in the REPL accepting a URL
+When Meerkat supports an import statement in the REPL accepting a URL
 (Issue #95), then we can easily import any service we want to update.
 
 When an update is executed, we need to acquire a write-lock on any service
 being deleted and on any members being deleted or modified.  That write-lock
 will prevent any transactions from reading or writing to the locked members.
 The type checker is run after locks are acquired but before applying the code
-update, and if there are type errors, the locks a released, the update is
+update, and if there are type errors, the locks are released, the update is
 canceled, and error messages are reported to the developer.
 
 ## Errors due to code update races
@@ -67,6 +67,6 @@ canceled, and error messages are reported to the developer.
 A code update will always preserve the code in a working state.  However, there
 could be races between executing some action and code updates.  Whichever
 acquires the appropriate locks will run.  If the code update runs first, some
-triggered actions could be invaliated.  We need to design a mechanism to report
+triggered actions could be invalidated.  We need to design a mechanism to report
 an error to the user in such cases, and/or for the programmer to catch any
 errors that are triggered by the update and run some other compensating action.
