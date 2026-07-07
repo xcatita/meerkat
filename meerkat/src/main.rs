@@ -585,31 +585,24 @@ async fn run_server(
                         )
                         .await;
                 }
-                // #39: a client is asking for a service's source code by name.
-                // Slice the requested service's block out of the server source
-                // and reply with it, or reply with an error if not found.
-                // #39: a client is requesting a .mkt file by path. Validate the
-                // length-bounded fields, then return the whole file source so
-                // the client can process it (services and any imports) through
-                // the normal program-loading path. The server currently hosts
-                // one program; mapping multiple paths to different files is a
-                // future extension.
+                // #39: a client is requesting a .mkt file by path. Return the
+                // whole file source (via the shared codec helper, which also
+                // validates the length-bounded fields) so the client can
+                // process it (services and any imports) through the normal
+                // program-loading path. The server currently hosts one program;
+                // mapping multiple paths to different files is a future
+                // extension.
                 MeerkatMessage::ServiceCodeRequest {
                     request_id,
                     path,
                     reply_to,
                 } => {
-                    let response = match codec::validate_service_code_request(&path, &reply_to) {
-                        Ok(()) => MeerkatMessage::ServiceCodeResponse {
-                            request_id,
-                            path,
-                            source: server_source.clone(),
-                        },
-                        Err(e) => MeerkatMessage::ServiceCodeError {
-                            request_id,
-                            error: e.to_string(),
-                        },
-                    };
+                    let response = codec::build_service_code_response(
+                        request_id,
+                        path,
+                        &reply_to,
+                        server_source.clone(),
+                    );
                     if let Some(net) = manager.network.as_mut() {
                         net.handle_command(NetworkCommand::SendMessage {
                             addr: Address::new(&reply_to),

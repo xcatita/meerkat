@@ -513,7 +513,7 @@ async fn test_circuit_relay() {
 /// assert the transport and whole-file return.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_service_code_request_roundtrip() {
-    use meerkat_lib::net::codec::validate_service_code_request;
+    use meerkat_lib::net::codec::build_service_code_response;
 
     let registry = MockNetwork::new_registry();
     let mut server = MockNetwork::new_with_registry(registry.clone());
@@ -569,18 +569,9 @@ async fn test_service_code_request_roundtrip() {
         other => panic!("Expected ServiceCodeRequest, got {:?}", other),
     };
 
-    // Server validates and returns the whole file source.
-    let response = match validate_service_code_request(&path, &reply_to) {
-        Ok(()) => MeerkatMessage::ServiceCodeResponse {
-            request_id,
-            path,
-            source: server_source.to_string(),
-        },
-        Err(e) => MeerkatMessage::ServiceCodeError {
-            request_id,
-            error: e.to_string(),
-        },
-    };
+    // Server builds the response via the same shared helper run_server uses.
+    let response =
+        build_service_code_response(request_id, path, &reply_to, server_source.to_string());
 
     server
         .handle_command(NetworkCommand::SendMessage {
@@ -610,7 +601,7 @@ async fn test_service_code_request_roundtrip() {
 /// and replies with a ServiceCodeError, which the client receives.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_service_code_request_rejects_oversized_path() {
-    use meerkat_lib::net::codec::validate_service_code_request;
+    use meerkat_lib::net::codec::build_service_code_response;
     use meerkat_lib::runtime::limits::MAX_NET_REQUEST_STRING_LENGTH;
 
     let registry = MockNetwork::new_registry();
@@ -666,17 +657,7 @@ async fn test_service_code_request_rejects_oversized_path() {
         other => panic!("Expected ServiceCodeRequest, got {:?}", other),
     };
 
-    let response = match validate_service_code_request(&path, &reply_to) {
-        Ok(()) => MeerkatMessage::ServiceCodeResponse {
-            request_id,
-            path,
-            source: "unused".to_string(),
-        },
-        Err(e) => MeerkatMessage::ServiceCodeError {
-            request_id,
-            error: e.to_string(),
-        },
-    };
+    let response = build_service_code_response(request_id, path, &reply_to, "unused".to_string());
 
     server
         .handle_command(NetworkCommand::SendMessage {

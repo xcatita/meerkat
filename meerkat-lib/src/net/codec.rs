@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::net::ast::{
     NetActionStmt, NetBinOp, NetExpr, NetField, NetParam, NetTableType, NetType, NetUnOp, NetValue,
 };
+use crate::net::types::MeerkatMessage;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
@@ -65,6 +66,30 @@ pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// #39: Build the response to a `ServiceCodeRequest`: validate the request's
+/// length-bounded fields and, on success, return a `ServiceCodeResponse`
+/// carrying the whole file source; on failure return a `ServiceCodeError`.
+/// Shared by `run_server` and the integration tests so both exercise the same
+/// logic rather than a hand-rolled copy.
+pub fn build_service_code_response(
+    request_id: u64,
+    path: String,
+    reply_to: &str,
+    source: String,
+) -> MeerkatMessage {
+    match validate_service_code_request(&path, reply_to) {
+        Ok(()) => MeerkatMessage::ServiceCodeResponse {
+            request_id,
+            path,
+            source,
+        },
+        Err(e) => MeerkatMessage::ServiceCodeError {
+            request_id,
+            error: e.to_string(),
+        },
+    }
 }
 
 /// #24: validate and intern the identifier fields of a `RequestUpdates`
