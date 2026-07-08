@@ -1846,4 +1846,69 @@ mod service_code_tests {
 
         assert_eq!(original_type, decoded);
     }
+
+    /// Verify round-trip encoding and decoding for an empty ServiceType (zero fields)
+    #[test]
+    fn test_codec_service_type_empty_roundtrip() {
+        let interner = Interner::new();
+        let fields = Env::new(None);
+
+        let original_type = ServiceType {
+            fields,
+            field_order: vec![],
+        };
+
+        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+        assert!(encoded.fields.is_empty());
+
+        let mut interner_new = Interner::new();
+        let decoded = decode_servicetype(encoded, &mut interner_new).unwrap();
+
+        assert_eq!(original_type, decoded);
+    }
+
+    /// Verify round-trip encoding and decoding for a ServiceType with complex types (Tuple, Func)
+    #[test]
+    fn test_codec_service_type_complex_roundtrip() {
+        let mut interner = Interner::new();
+        let field_tuple = interner.insert("t");
+        let field_func = interner.insert("f");
+
+        let mut fields = Env::new(None);
+        let tuple_ty = Type::Tuple(TupleType::new(vec![Type::Int, Type::String]).unwrap());
+        let func_ty = Type::Func(Box::new(Type::Bool), Box::new(Type::Unit));
+
+        fields.bind(field_tuple, tuple_ty);
+        fields.bind(field_func, func_ty);
+
+        let original_type = ServiceType {
+            fields,
+            field_order: vec![field_tuple, field_func],
+        };
+
+        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+
+        let mut interner_new = Interner::new();
+        let decoded = decode_servicetype(encoded, &mut interner_new).unwrap();
+
+        assert_eq!(original_type, decoded);
+    }
+
+    /// Verify that decode_servicetype returns an error if NetServiceType has duplicate field names
+    #[test]
+    fn test_codec_service_type_duplicate_fields_error() {
+        let invalid_nst = NetServiceType {
+            fields: vec![
+                ("duplicate_field".to_string(), NetType::Int),
+                ("duplicate_field".to_string(), NetType::String),
+            ],
+        };
+
+        let mut interner = Interner::new();
+        let res = decode_servicetype(invalid_nst, &mut interner);
+        assert!(res.is_err());
+        assert!(
+            matches!(res.unwrap_err(), Error::Message(ref msg) if msg.contains("duplicate field name"))
+        );
+    }
 }
