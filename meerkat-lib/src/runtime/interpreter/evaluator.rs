@@ -148,13 +148,8 @@ pub async fn eval(
                             val: s1 == s2 && e1 == e2,
                         });
                     }
-                    (
-                        Value::List { .. },
-                        Value::Range { .. },
-                    ) | (
-                        Value::Range { .. },
-                        Value::List { .. },
-                    ) => {
+                    (Value::List { .. }, Value::Range { .. })
+                    | (Value::Range { .. }, Value::List { .. }) => {
                         if let (Some(l1), Some(l2)) =
                             (val1.to_list_elements(), val2.to_list_elements())
                         {

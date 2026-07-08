@@ -212,7 +212,11 @@ fn free_vars_in_action_stmt(
         ActionStmt::Let { expr, .. } => expr.free_var(reactive_names, var_binded),
         ActionStmt::Expr(expr) => expr.free_var(reactive_names, var_binded),
         ActionStmt::Insert { row, .. } => row.free_var(reactive_names, var_binded),
-        ActionStmt::For { var, iterable, body } => {
+        ActionStmt::For {
+            var,
+            iterable,
+            body,
+        } => {
             let mut free_vars = iterable.free_var(reactive_names, var_binded);
             let mut body_binds = var_binded.clone();
             body_binds.insert(*var);

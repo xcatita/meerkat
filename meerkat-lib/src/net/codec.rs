@@ -787,7 +787,11 @@ pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> Result<NetA
                 table_name: table_str.to_string(),
             })
         }
-        ActionStmt::For { var, iterable, body } => {
+        ActionStmt::For {
+            var,
+            iterable,
+            body,
+        } => {
             let var_str = interner.get(*var).to_string();
             validate_identifier(&var_str)?;
             let encoded_iterable = encode_expr(iterable, interner)?;

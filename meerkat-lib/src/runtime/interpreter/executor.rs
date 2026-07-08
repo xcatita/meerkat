@@ -143,7 +143,11 @@ pub async fn execute(
             Ok(ExecuteEffect::ExprValue(val))
         }
         ActionStmt::Insert { .. } => Err(EvalError::NotImplemented),
-        ActionStmt::For { var, iterable, body } => {
+        ActionStmt::For {
+            var,
+            iterable,
+            body,
+        } => {
             let iterable_val = eval(
                 iterable,
                 env,

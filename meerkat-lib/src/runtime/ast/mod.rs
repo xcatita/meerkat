@@ -484,7 +484,11 @@ impl Display for ActionStmt {
             ActionStmt::Insert { row, table_name } => {
                 write!(f, "insert into {} {}", table_name, row)
             }
-            ActionStmt::For { var, iterable, body } => {
+            ActionStmt::For {
+                var,
+                iterable,
+                body,
+            } => {
                 write!(f, "for {} in {} {{ ", var, iterable)?;
                 for stmt in body {
                     write!(f, "{}; ", stmt)?;
