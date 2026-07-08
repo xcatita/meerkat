@@ -363,6 +363,11 @@ fn test_env_int_find_with_env_nested_fallback() {
     let mut child = Env::new(Some(&parent));
     child.bind(y, Type::Bool);
 
-    assert_eq!(child.find_with_env(x).unwrap().1, &Type::Int);
-    assert_eq!(child.find_with_env(y).unwrap().1, &Type::Bool);
+    let res_x = child.find_with_env(x).unwrap();
+    assert!(std::ptr::eq(res_x.0, &grandparent));
+    assert_eq!(res_x.1, &Type::Int);
+
+    let res_y = child.find_with_env(y).unwrap();
+    assert!(std::ptr::eq(res_y.0, &child));
+    assert_eq!(res_y.1, &Type::Bool);
 }
