@@ -1108,21 +1108,6 @@ impl Manager {
             .unwrap_or_else(|_| "127.0.0.1".to_string())
     }
 
-    /// Perform a remote variable lookup over the network
-    ///
-    /// Sends a lookup query to the node owning the remote service and registers
-    /// the local node as a transaction participant.
-    ///
-    /// Args:
-    ///     service (Symbol): The remote service symbol
-    ///     member (Symbol): The member/variable symbol within the service
-    ///     txn (Option<&mut Transaction>): The active transaction context
-    ///
-    /// Returns:
-    ///     Result<Value, EvalError>: The retrieved value, or a network/timeout error
-    ///
-    /// Raises:
-    ///     EvalError::LocalDispatchFailed: If a timeout or dispatch error occurs
     /// #39: Fetch the source of a `.mkt` file from a remote server by path.
     ///
     /// Sends a `ServiceCodeRequest` and awaits the reply, reusing the same
@@ -1169,6 +1154,21 @@ impl Manager {
         }
     }
 
+    /// Perform a remote variable lookup over the network
+    ///
+    /// Sends a lookup query to the node owning the remote service and registers
+    /// the local node as a transaction participant.
+    ///
+    /// Args:
+    ///     service (Symbol): The remote service symbol
+    ///     member (Symbol): The member/variable symbol within the service
+    ///     txn (Option<&mut Transaction>): The active transaction context
+    ///
+    /// Returns:
+    ///     Result<Value, EvalError>: The retrieved value, or a network/timeout error
+    ///
+    /// Raises:
+    ///     EvalError::LocalDispatchFailed: If a timeout or dispatch error occurs
     pub async fn remote_lookup(
         &mut self,
         service: Symbol,

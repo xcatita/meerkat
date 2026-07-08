@@ -1,6 +1,27 @@
 use meerkat_lib::net::*;
 use tokio::time::{sleep, Duration};
 
+/// #39: unique temp directory per test invocation, so file-serving tests do
+/// not share filesystem state.
+fn unique_test_dir(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "meerkat_it_{}_{}_{}_{}",
+        label,
+        std::process::id(),
+        nanos,
+        n
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_send_and_receive() {
     let mut server = NetworkActor::new(NodeType::Server).await.unwrap();
@@ -513,7 +534,7 @@ async fn test_circuit_relay() {
 /// assert the transport and whole-file return.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_service_code_request_roundtrip() {
-    use meerkat_lib::net::codec::build_service_code_response;
+    use meerkat_lib::net::codec::serve_service_code;
 
     let registry = MockNetwork::new_registry();
     let mut server = MockNetwork::new_with_registry(registry.clone());
@@ -538,8 +559,11 @@ async fn test_service_code_request_roundtrip() {
         other => panic!("Expected ListenSuccess, got {:?}", other),
     };
 
-    // The server's whole program source, hosting more than one service.
-    let server_source = "service counter { pub var count = 0; }\nservice other { var z = 1; }";
+    // The server serves files from a base directory; write the requested
+    // .mkt file there so the server can resolve and read it.
+    let served_dir = unique_test_dir("roundtrip");
+    let served_source = "service counter { pub var count = 0; }\nservice other { var z = 1; }";
+    std::fs::write(served_dir.join("counter.mkt"), served_source).unwrap();
 
     client
         .handle_command(NetworkCommand::SendMessage {
@@ -569,8 +593,9 @@ async fn test_service_code_request_roundtrip() {
         other => panic!("Expected ServiceCodeRequest, got {:?}", other),
     };
 
-    // Server builds the response via the same shared helper run_server uses.
-    let response = build_service_code_response(request_id, path, &reply_to, server_source);
+    // Server serves the file via the same helper run_server uses (validate,
+    // resolve the path against the base dir, read the file).
+    let response = serve_service_code(request_id, path, &reply_to, &served_dir);
 
     server
         .handle_command(NetworkCommand::SendMessage {
@@ -589,10 +614,12 @@ async fn test_service_code_request_roundtrip() {
             ..
         } => {
             // The whole file is returned, both services included.
-            assert_eq!(source, server_source);
+            assert_eq!(source, served_source);
         }
         other => panic!("Expected ServiceCodeResponse, got {:?}", other),
     }
+
+    let _ = std::fs::remove_dir_all(&served_dir);
 }
 
 /// #39: validation error path. A client sends a request whose path exceeds the
@@ -600,7 +627,7 @@ async fn test_service_code_request_roundtrip() {
 /// and replies with a ServiceCodeError, which the client receives.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_service_code_request_rejects_oversized_path() {
-    use meerkat_lib::net::codec::build_service_code_response;
+    use meerkat_lib::net::codec::serve_service_code;
     use meerkat_lib::runtime::limits::MAX_NET_REQUEST_STRING_LENGTH;
 
     let registry = MockNetwork::new_registry();
@@ -656,7 +683,11 @@ async fn test_service_code_request_rejects_oversized_path() {
         other => panic!("Expected ServiceCodeRequest, got {:?}", other),
     };
 
-    let response = build_service_code_response(request_id, path, &reply_to, "unused");
+    // Validation rejects the oversized path before any file I/O, so the base
+    // dir does not need to contain anything.
+    let served_dir = unique_test_dir("oversized");
+    let response = serve_service_code(request_id, path, &reply_to, &served_dir);
+    let _ = std::fs::remove_dir_all(&served_dir);
 
     server
         .handle_command(NetworkCommand::SendMessage {

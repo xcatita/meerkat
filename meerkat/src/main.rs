@@ -260,12 +260,13 @@ async fn run_server(
     local: bool,
     interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
-    // #39: keep the raw source so we can answer a ServiceCodeRequest by
-    // returning the server's current `.mkt` program text to the client on
-    // demand. Propagate a read error rather than silently serving empty
-    // source, which would make every code request fail.
-    let server_source = std::fs::read_to_string(input_file)
-        .map_err(|e| format!("Failed to read server source '{}': {}", input_file, e))?;
+    // #39: the directory the server was started from is the root for serving
+    // `.mkt` files: a ServiceCodeRequest names a file by path, which is
+    // resolved (safely) against this base directory and read on demand.
+    let served_base_dir = std::path::Path::new(input_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     let mut net = NetworkActor::new(NodeType::Server).await?;
     let mut manager = Manager::new(interner);
     manager.local = local;
@@ -585,23 +586,23 @@ async fn run_server(
                         )
                         .await;
                 }
-                // #39: a client is requesting a .mkt file by path. Return the
-                // whole file source (via the shared codec helper, which also
-                // validates the length-bounded fields) so the client can
-                // process it (services and any imports) through the normal
-                // program-loading path. The server currently hosts one program;
-                // mapping multiple paths to different files is a future
-                // extension.
+                // #39: a client is requesting a .mkt file by path. Validate,
+                // safely resolve the path against the served base directory,
+                // read that file, and reply with its whole source so the client
+                // can process it (services and any imports) through the normal
+                // program-loading path. Returning the requested file (not the
+                // server's own program) lets a client run code distinct from
+                // the server, which is the point of the web client.
                 MeerkatMessage::ServiceCodeRequest {
                     request_id,
                     path,
                     reply_to,
                 } => {
-                    let response = codec::build_service_code_response(
+                    let response = codec::serve_service_code(
                         request_id,
                         path,
                         &reply_to,
-                        &server_source,
+                        &served_base_dir,
                     );
                     if let Some(net) = manager.network.as_mut() {
                         net.handle_command(NetworkCommand::SendMessage {
