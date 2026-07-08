@@ -7,9 +7,12 @@ use crate::error::{Error, Result};
 use crate::net::ast::{
     NetActionStmt, NetBinOp, NetExpr, NetField, NetParam, NetTableType, NetType, NetUnOp, NetValue,
 };
+use crate::net::types::MeerkatMessage;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
 use crate::runtime::interner::{Interner, Symbol};
-use crate::runtime::limits::{MAX_IDENTIFIER_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH};
+use crate::runtime::limits::{
+    MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
+};
 use crate::runtime::tt::{Param, TupleType, Type};
 
 fn validate_identifier(s: &str) -> Result<()> {
@@ -47,6 +50,96 @@ fn validate_string_literal(s: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// #39: validate the length-bounded string fields of a `ServiceCodeRequest`
+/// arriving over the wire. `path` and `reply_to` are a resource path and a
+/// network address, not identifiers, so they are length-checked but not
+/// charset-validated or interned. The source in the response is unbounded.
+pub fn validate_service_code_request(path: &str, reply_to: &str) -> Result<()> {
+    for (field, value) in [("path", path), ("reply_to", reply_to)] {
+        if value.len() > MAX_NET_REQUEST_STRING_LENGTH {
+            return Err(Error::LimitExceeded(format!(
+                "{} exceeds maximum length of {} bytes",
+                field, MAX_NET_REQUEST_STRING_LENGTH
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// #39: Handle a `ServiceCodeRequest` end-to-end: validate the length-bounded
+/// fields, safely resolve the requested path against the server's base
+/// directory, read that file, and return a `ServiceCodeResponse` with its
+/// source, or a `ServiceCodeError` describing any failure.
+///
+/// Shared by `run_server` and the integration tests so both exercise the same
+/// logic. The whole file is returned so the client gets any imports and other
+/// services the requested file needs.
+pub fn serve_service_code(
+    request_id: u64,
+    path: String,
+    reply_to: &str,
+    base_dir: &std::path::Path,
+) -> MeerkatMessage {
+    let result = validate_service_code_request(&path, reply_to)
+        .and_then(|()| resolve_served_file(base_dir, &path))
+        .and_then(|file| {
+            std::fs::read_to_string(&file)
+                .map_err(|e| Error::LimitExceeded(format!("failed to read requested file: {}", e)))
+        });
+    match result {
+        Ok(source) => MeerkatMessage::ServiceCodeResponse {
+            request_id,
+            path,
+            source,
+        },
+        Err(e) => MeerkatMessage::ServiceCodeError {
+            request_id,
+            error: e.to_string(),
+        },
+    }
+}
+
+/// #39: Safely resolve a client-requested file path against a server base
+/// directory, for serving `.mkt` source over the network.
+///
+/// This is a zero-trust boundary: the path comes from the network, so it is
+/// validated to prevent directory traversal. An absolute path is rejected, and
+/// the resolved path is canonicalized and required to stay within the
+/// canonicalized base directory (blocking `..` and symlink escapes). Returns
+/// the validated path to read, or an error describing why it was rejected.
+pub fn resolve_served_file(
+    base_dir: &std::path::Path,
+    requested: &str,
+) -> Result<std::path::PathBuf> {
+    use std::path::Path;
+
+    // Reject absolute paths outright; served files are always relative to base.
+    if Path::new(requested).is_absolute() {
+        return Err(Error::LimitExceeded(format!(
+            "requested path must be relative, got absolute: {:?}",
+            requested
+        )));
+    }
+
+    let joined = base_dir.join(requested);
+
+    // Canonicalize both so `..` and symlinks are resolved, then require the
+    // target to remain within the base directory.
+    let canon_base = base_dir.canonicalize().map_err(|e| {
+        Error::LimitExceeded(format!("server base directory is unavailable: {}", e))
+    })?;
+    let canon_target = joined
+        .canonicalize()
+        .map_err(|_| Error::LimitExceeded(format!("requested file not found: {:?}", requested)))?;
+    if !canon_target.starts_with(&canon_base) {
+        return Err(Error::LimitExceeded(format!(
+            "requested path escapes the served directory: {:?}",
+            requested
+        )));
+    }
+    Ok(canon_target)
 }
 
 /// #24: validate and intern the identifier fields of a `RequestUpdates`
@@ -1514,5 +1607,78 @@ mod tests {
 
         let decoded_type = decode_type(encoded_type).unwrap();
         assert_eq!(original_type, decoded_type);
+    }
+}
+
+#[cfg(test)]
+mod service_code_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Create a unique temp directory for a test, so tests do not share
+    /// filesystem state (which would make them order-dependent or flaky).
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "meerkat_served_{}_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos,
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #39: a valid relative path within the base directory resolves.
+    #[test]
+    fn test_resolve_served_file_valid() {
+        let dir = unique_temp_dir("valid");
+        let file = dir.join("counter.mkt");
+        std::fs::write(&file, "service counter {}").unwrap();
+
+        let resolved = resolve_served_file(&dir, "counter.mkt").expect("should resolve");
+        assert_eq!(resolved, file.canonicalize().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #39: an absolute path is rejected.
+    #[test]
+    fn test_resolve_served_file_rejects_absolute() {
+        let dir = unique_temp_dir("abs");
+        let res = resolve_served_file(&dir, "/etc/passwd");
+        assert!(res.is_err(), "absolute path must be rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #39: a traversal path escaping the base directory is rejected.
+    #[test]
+    fn test_resolve_served_file_rejects_traversal() {
+        let root = unique_temp_dir("trav");
+        let base = root.join("base");
+        std::fs::create_dir_all(&base).unwrap();
+        // A secret file outside the base directory but inside the unique root.
+        std::fs::write(root.join("secret.mkt"), "secret").unwrap();
+
+        let res = resolve_served_file(&base, "../secret.mkt");
+        assert!(res.is_err(), "traversal outside base must be rejected");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #39: a missing file is rejected (not found).
+    #[test]
+    fn test_resolve_served_file_missing() {
+        let dir = unique_temp_dir("missing");
+        let res = resolve_served_file(&dir, "nope.mkt");
+        assert!(res.is_err(), "missing file must be rejected");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

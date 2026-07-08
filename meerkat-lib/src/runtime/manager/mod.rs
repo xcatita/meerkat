@@ -930,6 +930,13 @@ impl Manager {
                             MeerkatMessage::CommitResponse { request_id, .. } => Some(*request_id),
                             MeerkatMessage::AbortResponse { request_id, .. } => Some(*request_id),
                             MeerkatMessage::WaitParked { request_id, .. } => Some(*request_id),
+                            // #39: code responses are replies routed to the waiting client.
+                            MeerkatMessage::ServiceCodeResponse { request_id, .. } => {
+                                Some(*request_id)
+                            }
+                            MeerkatMessage::ServiceCodeError { request_id, .. } => {
+                                Some(*request_id)
+                            }
                             MeerkatMessage::Ping { .. }
                             | MeerkatMessage::Pong { .. }
                             | MeerkatMessage::Announce { .. }
@@ -940,6 +947,8 @@ impl Manager {
                             | MeerkatMessage::Commit { .. }
                             | MeerkatMessage::Abort { .. }
                             | MeerkatMessage::RequestUpdates { .. }
+                            // #39: an incoming code request is handled server-side, not a reply.
+                            | MeerkatMessage::ServiceCodeRequest { .. }
                             | MeerkatMessage::Update { .. } => None,
                         };
                         if let Some(request_id) = rid {
@@ -1099,6 +1108,52 @@ impl Manager {
             .unwrap_or_else(|_| "127.0.0.1".to_string())
     }
 
+    /// #39: Fetch the source of a `.mkt` file from a remote server by path.
+    ///
+    /// Sends a `ServiceCodeRequest` and awaits the reply, reusing the same
+    /// request/reply machinery as remote lookups. Returns the source text of
+    /// the requested `.mkt` file. The caller processes it through the
+    /// normal program-loading path (creating services and resolving imports),
+    /// rather than a separate loop here, to avoid duplicating that logic. This
+    /// is the mechanism a browser client uses to load a file it imports but
+    /// cannot read from a local disk.
+    pub async fn fetch_service_source(
+        &mut self,
+        path: &str,
+        server_addr: Address,
+    ) -> Result<String, EvalError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+        let request_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let reply_to = self.local_reply_addr().await;
+
+        let msg = MeerkatMessage::ServiceCodeRequest {
+            request_id,
+            path: path.to_string(),
+            reply_to,
+        };
+
+        let reply = self
+            .send_and_await_reply(
+                server_addr,
+                msg,
+                request_id,
+                format!("Timeout waiting for source of file '{}'", path),
+            )
+            .await?;
+
+        match reply {
+            MeerkatMessage::ServiceCodeResponse { source, .. } => Ok(source),
+            MeerkatMessage::ServiceCodeError { error, .. } => {
+                Err(EvalError::RemoteDispatchFailed(error))
+            }
+            _ => Err(EvalError::RemoteDispatchFailed(
+                "Unexpected reply to service code request".to_string(),
+            )),
+        }
+    }
+
     /// Perform a remote variable lookup over the network
     ///
     /// Sends a lookup query to the node owning the remote service and registers
@@ -1187,6 +1242,9 @@ impl Manager {
             | MeerkatMessage::AbortResponse { .. }
             | MeerkatMessage::RequestUpdates { .. }
             | MeerkatMessage::Update { .. }
+            | MeerkatMessage::ServiceCodeRequest { .. }
+            | MeerkatMessage::ServiceCodeResponse { .. }
+            | MeerkatMessage::ServiceCodeError { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to lookup request".to_string(),
             )),
@@ -1322,6 +1380,9 @@ impl Manager {
             | MeerkatMessage::AbortResponse { .. }
             | MeerkatMessage::RequestUpdates { .. }
             | MeerkatMessage::Update { .. }
+            | MeerkatMessage::ServiceCodeRequest { .. }
+            | MeerkatMessage::ServiceCodeResponse { .. }
+            | MeerkatMessage::ServiceCodeError { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to action request".to_string(),
             )),
@@ -1753,6 +1814,9 @@ impl Manager {
             | MeerkatMessage::AbortResponse { .. }
             | MeerkatMessage::RequestUpdates { .. }
             | MeerkatMessage::Update { .. }
+            | MeerkatMessage::ServiceCodeRequest { .. }
+            | MeerkatMessage::ServiceCodeResponse { .. }
+            | MeerkatMessage::ServiceCodeError { .. }
             | MeerkatMessage::WaitParked { .. } => Err(EvalError::LocalDispatchFailed(
                 "Unexpected reply to commit".to_string(),
             )),

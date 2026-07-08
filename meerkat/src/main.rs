@@ -106,7 +106,7 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             if args.server {
-                run_server(prog, remote_url_map, args.port, args.local, interner).await
+                run_server(prog, file, remote_url_map, args.port, args.local, interner).await
             } else {
                 run_client(prog, file, remote_url_map, args.local, args.watch, interner).await
             }
@@ -254,11 +254,19 @@ fn listen_success_addr(reply: NetworkReply) -> Result<Address, Box<dyn Error>> {
 
 async fn run_server(
     prog: Vec<Stmt>,
+    input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     port: u16,
     local: bool,
     interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
+    // #39: the directory the server was started from is the root for serving
+    // `.mkt` files: a ServiceCodeRequest names a file by path, which is
+    // resolved (safely) against this base directory and read on demand.
+    let served_base_dir = std::path::Path::new(input_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     let mut net = NetworkActor::new(NodeType::Server).await?;
     let mut manager = Manager::new(interner);
     manager.local = local;
@@ -578,6 +586,32 @@ async fn run_server(
                         )
                         .await;
                 }
+                // #39: a client is requesting a .mkt file by path. Validate,
+                // safely resolve the path against the served base directory,
+                // read that file, and reply with its whole source so the client
+                // can process it (services and any imports) through the normal
+                // program-loading path. Returning the requested file (not the
+                // server's own program) lets a client run code distinct from
+                // the server, which is the point of the web client.
+                MeerkatMessage::ServiceCodeRequest {
+                    request_id,
+                    path,
+                    reply_to,
+                } => {
+                    let response = codec::serve_service_code(
+                        request_id,
+                        path,
+                        &reply_to,
+                        &served_base_dir,
+                    );
+                    if let Some(net) = manager.network.as_mut() {
+                        net.handle_command(NetworkCommand::SendMessage {
+                            addr: Address::new(&reply_to),
+                            msg: response,
+                        })
+                        .await;
+                    }
+                }
                 MeerkatMessage::Ping { .. }
                 | MeerkatMessage::Pong { .. }
                 | MeerkatMessage::Announce { .. }
@@ -588,6 +622,9 @@ async fn run_server(
                 | MeerkatMessage::ActionResponse { .. }
                 | MeerkatMessage::CommitResponse { .. }
                 | MeerkatMessage::AbortResponse { .. }
+                // #39: code responses are client-bound replies, not seen at the server.
+                | MeerkatMessage::ServiceCodeResponse { .. }
+                | MeerkatMessage::ServiceCodeError { .. }
                 | MeerkatMessage::WaitParked { .. } => {}
             }
         }

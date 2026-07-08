@@ -56,7 +56,7 @@ impl<'a> AstPrinter<'a> {
     }
 
     /// Prints spaces corresponding to the current indentation level
-    fn print_indent(&self, indent: usize) {
+    pub(crate) fn print_indent(&self, indent: usize) {
         print!("{}", " ".repeat(indent * self.spaces));
     }
 
@@ -230,17 +230,9 @@ impl<'a> AstPrinter<'a> {
             }
             Expr::Html(template) => {
                 println!("Html:");
-                for part in template.parts() {
-                    match part {
-                        crate::runtime::html::HtmlPartView::Text(t) => {
-                            self.print_indent(indent + 1);
-                            println!("Text: {:?}", t);
-                        }
-                        crate::runtime::html::HtmlPartView::Expr(e) => {
-                            self.print_expr(e, indent + 1)
-                        }
-                    }
-                }
+                // #39: the html module owns how a template prints itself, so the
+                // representation stays hidden here.
+                template.print_ast(self, indent + 1);
             }
             Expr::Tuple { val } => {
                 println!("Tuple:");
