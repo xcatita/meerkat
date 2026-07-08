@@ -54,6 +54,11 @@ impl Expr {
                     arg.alpha_rename(var_binded, renames);
                 }
             }
+            Expr::Html(template) => {
+                for e in template.embedded_exprs_mut() {
+                    e.alpha_rename(var_binded, renames);
+                }
+            }
 
             Expr::Action(stmts) => {
                 for stmt in stmts {

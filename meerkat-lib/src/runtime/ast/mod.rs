@@ -1,4 +1,5 @@
 use crate::net::ServiceNetId;
+use crate::runtime::html::{Html, HtmlTemplate};
 use crate::runtime::interner::Symbol;
 use crate::runtime::tt::{Param, Type};
 use std::fmt::Display;
@@ -95,6 +96,9 @@ pub enum Value {
     String {
         val: String,
     },
+    /// An evaluated HTML value. The representation is encapsulated by the
+    /// `Html` ADT; see `runtime::html`.
+    Html(Html),
     Closure {
         params: Vec<Param>,
         body: Box<Expr>,
@@ -144,6 +148,11 @@ pub enum Expr {
     Literal {
         val: Value,
     },
+    /// An HTML template literal. The representation is encapsulated by the
+    /// `HtmlTemplate` ADT in `runtime::html`; the embedded expressions are
+    /// reached through its interface so dependency analysis tracks them, and
+    /// it renders to a `Value::Html` at evaluation time.
+    Html(HtmlTemplate),
     Variable {
         name: Symbol,
     },
@@ -295,6 +304,7 @@ impl Display for Value {
             Value::Int { val } => write!(f, "{}", val),
             Value::Bool { val } => write!(f, "{}", val),
             Value::String { val } => write!(f, "\"{}\"", val),
+            Value::Html(html) => write!(f, "{}", html),
             Value::Closure {
                 params,
                 body,
@@ -370,6 +380,7 @@ impl Display for Expr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Expr::Literal { val } => write!(f, "{}", val),
+            Expr::Html(_) => write!(f, "<html>"),
             Expr::Tuple { .. } => write!(f, "vector"),
             Expr::KeyVal { name, value } => write!(f, "keyval: {}, {}", name, value),
             Expr::Variable { name } => write!(f, "{}", name),

@@ -32,17 +32,18 @@ use logos::Logos;
 ///
 /// Returns:
 ///     `Result<Vec<Stmt>, String>`: The parsed statements, or an error string
-pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, String> {
+/// #39: Lex `src` into a token stream, enforcing the identifier and string
+/// literal length limits. Shared by the top-level parse paths and html
+/// interpolation parsing so the checks cannot drift out of sync.
+fn build_validated_lex_stream(src: &str) -> Result<Vec<(usize, lex::Token<'_>, usize)>, String> {
     let mut lex_stream = Vec::new();
-    for (t, span) in lex::Token::lexer(input).spanned() {
+    for (t, span) in lex::Token::lexer(src).spanned() {
         match t {
-            lex::Token::Ident(name) => {
-                if name.len() > MAX_IDENTIFIER_LENGTH {
-                    return Err(format!(
-                        "Parse error: identifier exceeds maximum length of {} characters",
-                        MAX_IDENTIFIER_LENGTH
-                    ));
-                }
+            lex::Token::Ident(name) if name.len() > MAX_IDENTIFIER_LENGTH => {
+                return Err(format!(
+                    "Parse error: identifier exceeds maximum length of {} characters",
+                    MAX_IDENTIFIER_LENGTH
+                ));
             }
             lex::Token::StrLit(val) if val.len() > MAX_STRING_LITERAL_LENGTH => {
                 return Err(format!(
@@ -54,6 +55,11 @@ pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, S
         }
         lex_stream.push((span.start, t, span.end));
     }
+    Ok(lex_stream)
+}
+
+pub fn parse_string(input: &str, interner: &mut Interner) -> Result<Vec<Stmt>, String> {
+    let lex_stream = build_validated_lex_stream(input)?;
 
     meerkat::ProgParser::new()
         .parse(input, interner, lex_stream)
@@ -95,13 +101,11 @@ pub fn parse_repl(input: &str, interner: &mut Interner) -> ReplParseResult {
     let mut lex_stream = Vec::new();
     for (t, span) in lex::Token::lexer(input).spanned() {
         match t {
-            lex::Token::Ident(name) => {
-                if name.len() > MAX_IDENTIFIER_LENGTH {
-                    return ReplParseResult::Error(format!(
-                        "Parse error: identifier exceeds maximum length of {} characters",
-                        MAX_IDENTIFIER_LENGTH
-                    ));
-                }
+            lex::Token::Ident(name) if name.len() > MAX_IDENTIFIER_LENGTH => {
+                return ReplParseResult::Error(format!(
+                    "Parse error: identifier exceeds maximum length of {} characters",
+                    MAX_IDENTIFIER_LENGTH
+                ));
             }
             lex::Token::StrLit(val) if val.len() > MAX_STRING_LITERAL_LENGTH => {
                 return ReplParseResult::Error(format!(
@@ -123,6 +127,78 @@ pub fn parse_repl(input: &str, interner: &mut Interner) -> ReplParseResult {
         Err(ParseError::UnrecognizedEof { .. }) => ReplParseResult::Incomplete,
         Err(e) => ReplParseResult::Error(format!("{:?}", e)),
     }
+}
+
+/// #39: Parse the raw body of an HTML literal into an `HtmlTemplate`.
+///
+/// Lives in `runtime::parser` because it interns (via the expression parser),
+/// and only `parser`/`net::codec` may write to the append-only interner. The
+/// template representation itself is owned by `runtime::html`; this function
+/// builds one through the html builder without naming its internal parts.
+///
+/// Literal text is copied verbatim; each brace-delimited `{ ... }`
+/// interpolation is parsed as an expression through the public `Expr` rule.
+/// A `{` with no matching `}` is a parse error.
+pub fn parse_template(
+    raw: &str,
+    interner: &mut Interner,
+) -> Result<crate::runtime::html::HtmlTemplate, String> {
+    let mut builder = crate::runtime::html::HtmlTemplateBuilder::new();
+    let mut text = String::new();
+    let mut chars = raw.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c == '{' {
+            builder.push_text(std::mem::take(&mut text).as_str());
+            // #39: brace depth counting does not account for a `}` inside a
+            // string literal within the interpolation (e.g. `{ "}" }`); such a
+            // brace would desync the counter. This mirrors the analogous
+            // paren-depth limitation documented in the html lexer; making both
+            // string-aware is tracked as a follow-up.
+            let mut depth: usize = 1;
+            let mut frag = String::new();
+            let mut closed = false;
+            for (_, ic) in chars.by_ref() {
+                match ic {
+                    '{' => {
+                        depth += 1;
+                        frag.push(ic);
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            closed = true;
+                            break;
+                        }
+                        frag.push(ic);
+                    }
+                    _ => frag.push(ic),
+                }
+            }
+            if !closed {
+                return Err(
+                    "Parse error: unterminated { } interpolation in html literal".to_string(),
+                );
+            }
+            let expr = parse_expr_fragment(frag.trim(), interner)?;
+            builder.push_expr(expr);
+        } else {
+            text.push(c);
+        }
+    }
+    builder.push_text(text.as_str());
+    Ok(builder.build())
+}
+
+/// #39: Parse a single interpolation fragment into an `Expr` using the public
+/// `Expr` grammar rule, reusing the same lexer and parser as top-level code.
+/// The identifier and string-literal length limits enforced by the top-level
+/// parser are applied here too, so interpolations cannot bypass those limits.
+fn parse_expr_fragment(src: &str, interner: &mut Interner) -> Result<crate::ast::Expr, String> {
+    let lex_stream = build_validated_lex_stream(src)?;
+    meerkat::ExprParser::new()
+        .parse(src, interner, lex_stream)
+        .map_err(|e| format!("Parse error in html interpolation: {:?}", e))
 }
 
 #[cfg(test)]
@@ -247,5 +323,91 @@ mod tests {
         } else {
             panic!("Expected Service Stmt");
         }
+    }
+
+    /// #39: parse_template splits literal text and interpolations, exposing the
+    /// embedded expression through the template interface.
+    #[test]
+    fn test_parse_template_interpolation() {
+        use crate::ast::Expr;
+        let mut interner = Interner::new();
+        let template =
+            parse_template("The count is {count}.", &mut interner).expect("should parse");
+        let exprs: Vec<&Expr> = template.embedded_exprs().collect();
+        assert_eq!(exprs.len(), 1, "expected one embedded expression");
+        assert!(
+            matches!(exprs[0], Expr::Variable { .. }),
+            "expected Variable, got {:?}",
+            exprs[0]
+        );
+    }
+
+    /// #39: a template with no interpolation exposes no embedded expressions.
+    #[test]
+    fn test_parse_template_text_only() {
+        let mut interner = Interner::new();
+        let template = parse_template("<p>hello</p>", &mut interner).expect("should parse");
+        assert_eq!(template.embedded_exprs().count(), 0);
+    }
+
+    /// #39: an unterminated interpolation is an error, not a panic.
+    #[test]
+    fn test_parse_template_unterminated() {
+        let mut interner = Interner::new();
+        let res = parse_template("count is {count", &mut interner);
+        assert!(res.is_err());
+    }
+
+    /// #39: the html literal lexes and parses through to an Expr::Html node.
+    #[test]
+    fn test_html_literal_parses() {
+        use crate::ast::{Decl, Expr, Stmt};
+        let mut interner = Interner::new();
+        let input = "service s { pub def h = (<p>hi</p>); }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "parse failed: {:?}", res);
+        let ast = res.unwrap();
+        match &ast[0] {
+            Stmt::Service { decls, .. } => match &decls[0] {
+                Decl::DefDecl { val, .. } => {
+                    assert!(
+                        matches!(val, Expr::Html(_)),
+                        "expected Expr::Html, got {:?}",
+                        val
+                    );
+                }
+                other => panic!("expected DefDecl, got {:?}", other),
+            },
+            other => panic!("expected Service, got {:?}", other),
+        }
+    }
+
+    /// #39: the full pipeline parses an html def with an interpolation; the
+    /// template exposes the parsed embedded expression through its interface.
+    #[test]
+    fn test_html_literal_full_parse() {
+        use crate::ast::{Decl, Expr, Stmt};
+        let mut interner = Interner::new();
+        let input = "service webClient { pub def html = (<p>The count is {count}.</p>); }";
+        let res = parse_string(input, &mut interner);
+        assert!(res.is_ok(), "parse failed: {:?}", res);
+        let ast = res.unwrap();
+        let template = match &ast[0] {
+            Stmt::Service { decls, .. } => match &decls[0] {
+                Decl::DefDecl {
+                    val: Expr::Html(template),
+                    ..
+                } => template,
+                other => panic!("expected DefDecl with Expr::Html, got {:?}", other),
+            },
+            other => panic!("expected Service, got {:?}", other),
+        };
+        let exprs: Vec<&Expr> = template.embedded_exprs().collect();
+        assert_eq!(exprs.len(), 1, "expected one embedded expression");
+        assert!(
+            matches!(exprs[0], Expr::Variable { .. }),
+            "expected Variable, got {:?}",
+            exprs[0]
+        );
     }
 }

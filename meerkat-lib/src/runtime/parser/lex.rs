@@ -66,6 +66,42 @@ fn skip_multi_line_comments<'b>(lex: &mut Lexer<'b, Token<'b>>) -> Skip {
     Skip
 }
 
+// #39: Lex an html literal of the form `( <...> )`. The opening `(` and the
+// following `<` have already been consumed by the token regex. Starting with
+// paren depth 1 (for that `(`), scan forward until the matching `)` brings the
+// depth back to 0, then return the inner slice (between the outer parens).
+// Balanced parens inside the literal (e.g. in a `{ f(x) }` interpolation) do
+// not terminate it; only the final unbalanced `)` does. Known limitation: a
+// literal `)` inside a string inside an interpolation is not accounted for and
+// would terminate the literal early; the current examples do not hit this.
+fn lex_html_literal<'b>(lex: &mut Lexer<'b, Token<'b>>) -> Option<&'b str> {
+    // On entry the current token is `(` + optional whitespace + `<`, so paren
+    // depth is 1 for that opening `(`. `remainder()` is the source after the
+    // `<`; scan it for the matching `)`, counting balanced parens (so parens
+    // inside a `{ f(x) }` interpolation do not terminate the literal).
+    let rem = lex.remainder();
+    let mut depth: isize = 1;
+    for (consumed, &byte) in rem.as_bytes().iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Extend the token through the closing `)` (a byte count;
+                    // `)` is ASCII so this lands on a char boundary).
+                    lex.bump(consumed + 1);
+                    // The token slice is now `( ... )`; the body is the slice
+                    // with the outer parens stripped.
+                    let full = lex.slice();
+                    return Some(&full[1..full.len() - 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None // unterminated html literal
+}
+
 impl<'a> fmt::Display for Token<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:#?}", self)
@@ -78,6 +114,10 @@ impl<'a> fmt::Display for Token<'a> {
 pub enum Token<'a> {
     #[regex(r#""[^"]*""#, |lex| lex.slice().trim_matches('"'))] // regex for string within ""
     StrLit(&'a str),
+    // #39: html literal triggered by `(` + optional whitespace + `<`. Longer
+    // than the bare `(` token, so logos prefers it only when a literal begins.
+    #[regex(r"\(\s*<", lex_html_literal)]
+    HtmlLit(&'a str),
     #[regex(r"(?&identifier)")]
     Ident(&'a str),
 
@@ -210,4 +250,92 @@ pub enum Token<'a> {
     #[error]
     #[regex(r#"[^\x00-\x7F]"#)] // Error on non ascii characters
     Error,
+}
+
+#[cfg(test)]
+mod html_lex_tests {
+    use super::*;
+    use logos::Logos;
+
+    // #39: collect the tokens (and captured slices) for a source string.
+    fn lex_all(src: &str) -> Vec<Token<'_>> {
+        Token::lexer(src).collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn test_html_literal_basic() {
+        let toks = lex_all("(<p>hello</p>)");
+        assert_eq!(
+            toks.len(),
+            1,
+            "expected a single HtmlLit token, got {:?}",
+            toks
+        );
+        match &toks[0] {
+            Token::HtmlLit(inner) => assert_eq!(*inner, "<p>hello</p>"),
+            other => panic!("expected HtmlLit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_html_literal_with_interpolation() {
+        let toks = lex_all("(<p>The count is {count}.</p>)");
+        assert_eq!(
+            toks.len(),
+            1,
+            "expected a single HtmlLit token, got {:?}",
+            toks
+        );
+        match &toks[0] {
+            Token::HtmlLit(inner) => assert_eq!(*inner, "<p>The count is {count}.</p>"),
+            other => panic!("expected HtmlLit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_html_literal_ignores_balanced_parens_in_interpolation() {
+        let toks = lex_all("(<p>{f(x)}</p>)");
+        assert_eq!(
+            toks.len(),
+            1,
+            "balanced parens inside must not end the literal: {:?}",
+            toks
+        );
+        match &toks[0] {
+            Token::HtmlLit(inner) => assert_eq!(*inner, "<p>{f(x)}</p>"),
+            other => panic!("expected HtmlLit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_html_literal_with_leading_whitespace() {
+        // `(` then whitespace then `<` still triggers the literal.
+        let toks = lex_all("(  <p>x</p>)");
+        assert_eq!(
+            toks.len(),
+            1,
+            "expected a single HtmlLit token, got {:?}",
+            toks
+        );
+        match &toks[0] {
+            Token::HtmlLit(inner) => assert_eq!(*inner, "  <p>x</p>"),
+            other => panic!("expected HtmlLit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_plain_paren_is_not_html() {
+        // `(` not followed by `<` must remain an ordinary LParen, not html.
+        let toks = lex_all("(1 + 2)");
+        assert!(
+            matches!(toks.first(), Some(Token::LParen)),
+            "plain paren must lex as LParen, got {:?}",
+            toks
+        );
+        assert!(
+            !toks.iter().any(|t| matches!(t, Token::HtmlLit(_))),
+            "no HtmlLit expected in a plain parenthesized expression: {:?}",
+            toks
+        );
+    }
 }
