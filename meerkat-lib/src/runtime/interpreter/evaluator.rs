@@ -148,13 +148,20 @@ pub async fn eval(
                             val: s1 == s2 && e1 == e2,
                         });
                     }
-                    _ => {
+                    (
+                        Value::List { .. },
+                        Value::Range { .. },
+                    ) | (
+                        Value::Range { .. },
+                        Value::List { .. },
+                    ) => {
                         if let (Some(l1), Some(l2)) =
                             (val1.to_list_elements(), val2.to_list_elements())
                         {
                             return Ok(Value::Bool { val: l1 == l2 });
                         }
                     }
+                    _ => {}
                 }
             }
             match (op, val1, val2) {
