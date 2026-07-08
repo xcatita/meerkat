@@ -213,6 +213,17 @@ impl<'a> AstPrinter<'a> {
                 );
                 self.print_expr(row, indent + 1);
             }
+            ActionStmt::For { var, range, body } => {
+                let var = *var;
+                println!(
+                    "For: {{ var: {} }}",
+                    self.format_symbol(var)
+                );
+                self.print_expr(range, indent + 1);
+                for stmt in body {
+                    self.print_action_stmt(stmt, indent + 1);
+                }
+            }
         }
     }
 
@@ -345,6 +356,17 @@ impl<'a> AstPrinter<'a> {
                 self.print_expr(operation, indent + 1);
                 self.print_expr(identity, indent + 1);
             }
+            Expr::List(exprs) => {
+                println!("List:");
+                for expr in exprs {
+                    self.print_expr(expr, indent + 1);
+                }
+            }
+            Expr::Range { start, end } => {
+                println!("Range:");
+                self.print_expr(start, indent + 1);
+                self.print_expr(end, indent + 1);
+            }
         }
     }
 
@@ -401,6 +423,15 @@ impl<'a> AstPrinter<'a> {
                 for stmt in stmts {
                     self.print_action_stmt(stmt, indent + 1);
                 }
+            }
+            Value::List { vals } => {
+                println!("List:");
+                for val in vals {
+                    self.print_value(val, indent + 1);
+                }
+            }
+            Value::Range { start, end } => {
+                println!("Range: {}..{}", start, end);
             }
         }
     }

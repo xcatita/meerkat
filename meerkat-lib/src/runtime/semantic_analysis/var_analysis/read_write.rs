@@ -68,30 +68,7 @@ impl Expr {
             Expr::Action(stmts) => {
                 let mut free_vars = HashSet::new();
                 for stmt in stmts {
-                    match stmt {
-                        ActionStmt::Assign { name: _, expr } => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Do(expr) => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Assert(expr, _) => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Let {
-                            name: _,
-                            ty: _,
-                            expr,
-                        } => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Expr(expr) => {
-                            free_vars.extend(expr.free_var(reactive_names, var_binded));
-                        }
-                        ActionStmt::Insert { row, .. } => {
-                            free_vars.extend(row.free_var(reactive_names, var_binded));
-                        }
-                    }
+                    free_vars.extend(free_vars_in_action_stmt(stmt, reactive_names, var_binded));
                 }
                 free_vars.difference(reactive_names).cloned().collect()
             }
@@ -118,6 +95,42 @@ impl Expr {
                 free_vars.extend(identity.free_var(reactive_names, var_binded));
                 free_vars
             }
+            Expr::List(val) => {
+                let mut free_vars = HashSet::new();
+                for item in val {
+                    free_vars.extend(item.free_var(reactive_names, var_binded));
+                }
+                free_vars
+            }
+            Expr::Range { start, end } => {
+                let mut free_vars = start.free_var(reactive_names, var_binded);
+                free_vars.extend(end.free_var(reactive_names, var_binded));
+                free_vars
+            }
+        }
+    }
+}
+
+fn free_vars_in_action_stmt(
+    stmt: &ActionStmt,
+    reactive_names: &HashSet<Symbol>,
+    var_binded: &HashSet<Symbol>,
+) -> HashSet<Symbol> {
+    match stmt {
+        ActionStmt::Assign { expr, .. } => expr.free_var(reactive_names, var_binded),
+        ActionStmt::Do(expr) => expr.free_var(reactive_names, var_binded),
+        ActionStmt::Assert(expr, _) => expr.free_var(reactive_names, var_binded),
+        ActionStmt::Let { expr, .. } => expr.free_var(reactive_names, var_binded),
+        ActionStmt::Expr(expr) => expr.free_var(reactive_names, var_binded),
+        ActionStmt::Insert { row, .. } => row.free_var(reactive_names, var_binded),
+        ActionStmt::For { var, range, body } => {
+            let mut free_vars = range.free_var(reactive_names, var_binded);
+            let mut body_binds = var_binded.clone();
+            body_binds.insert(*var);
+            for s in body {
+                free_vars.extend(free_vars_in_action_stmt(s, reactive_names, &body_binds));
+            }
+            free_vars
         }
     }
 }

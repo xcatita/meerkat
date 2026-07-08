@@ -17,6 +17,7 @@ pub enum Type {
     Unit,
     Tuple(TupleType),
     Func(Box<Type>, Box<Type>),
+    List(Box<Type>),
 }
 
 /// A tuple type wrapping a list of types of arity 2 or greater
@@ -110,9 +111,15 @@ impl std::fmt::Display for Type {
                         write!(f, "({}) -> {}", t1, t2)
                     }
                     Type::Unit => write!(f, "() -> {}", t2),
-                    Type::Int | Type::String | Type::Bool | Type::Tuple(_) => {
+                    Type::Int | Type::String | Type::Bool | Type::Tuple(_) | Type::List(_) => {
                         write!(f, "{} -> {}", t1, t2)
                     }
+                }
+            }
+            Type::List(t) => {
+                match t.as_ref() {
+                    Type::Func(..) => write!(f, "({}) list", t),
+                    _ => write!(f, "{} list", t),
                 }
             }
         }

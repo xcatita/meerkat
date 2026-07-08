@@ -69,6 +69,10 @@ fn encode_type_internal(ty: &Type, depth: usize) -> Result<NetType> {
             let et2 = encode_type_internal(t2, depth + 1)?;
             Ok(NetType::Func(Box::new(et1), Box::new(et2)))
         }
+        Type::List(t) => {
+            let et = encode_type_internal(t, depth + 1)?;
+            Ok(NetType::List(Box::new(et)))
+        }
     }
 }
 
@@ -132,6 +136,10 @@ fn decode_type_internal(ty: NetType, depth: usize) -> Result<Type> {
             let dt1 = decode_type_internal(*t1, depth + 1)?;
             let dt2 = decode_type_internal(*t2, depth + 1)?;
             Ok(Type::Func(Box::new(dt1), Box::new(dt2)))
+        }
+        NetType::List(t) => {
+            let dt = decode_type_internal(*t, depth + 1)?;
+            Ok(Type::List(Box::new(dt)))
         }
     }
 }
@@ -256,6 +264,16 @@ pub fn encode_value(val: &Value, interner: &Interner) -> Result<NetValue> {
                 service_net_id: service_net_id.clone(),
             })
         }
+        Value::List { vals } => {
+            let mut encoded = Vec::new();
+            for v in vals {
+                encoded.push(encode_value(v, interner)?);
+            }
+            Ok(NetValue::List { vals: encoded })
+        }
+        Value::Range { start, end } => {
+            Ok(NetValue::Range { start: *start, end: *end })
+        }
     }
 }
 
@@ -322,6 +340,16 @@ pub fn decode_value(val: NetValue, interner: &mut Interner) -> Result<Value> {
                 env: decoded_env,
                 service_net_id,
             })
+        }
+        NetValue::List { vals } => {
+            let mut decoded = Vec::new();
+            for v in vals {
+                decoded.push(decode_value(v, interner)?);
+            }
+            Ok(Value::List { vals: decoded })
+        }
+        NetValue::Range { start, end } => {
+            Ok(Value::Range { start, end })
         }
     }
 }
@@ -473,6 +501,19 @@ pub fn encode_expr(expr: &Expr, interner: &Interner) -> Result<NetExpr> {
                 identity: Box::new(encode_expr(identity, interner)?),
             })
         }
+        Expr::List(exprs) => {
+            let mut encoded = Vec::new();
+            for e in exprs {
+                encoded.push(encode_expr(e, interner)?);
+            }
+            Ok(NetExpr::List(encoded))
+        }
+        Expr::Range { start, end } => {
+            Ok(NetExpr::Range {
+                start: Box::new(encode_expr(start, interner)?),
+                end: Box::new(encode_expr(end, interner)?),
+            })
+        }
     }
 }
 
@@ -617,6 +658,19 @@ pub fn decode_expr(expr: NetExpr, interner: &mut Interner) -> Result<Expr> {
                 identity: Box::new(decode_expr(*identity, interner)?),
             })
         }
+        NetExpr::List(exprs) => {
+            let mut decoded = Vec::new();
+            for e in exprs {
+                decoded.push(decode_expr(e, interner)?);
+            }
+            Ok(Expr::List(decoded))
+        }
+        NetExpr::Range { start, end } => {
+            Ok(Expr::Range {
+                start: Box::new(decode_expr(*start, interner)?),
+                end: Box::new(decode_expr(*end, interner)?),
+            })
+        }
     }
 }
 
@@ -666,6 +720,20 @@ pub fn encode_action_stmt(stmt: &ActionStmt, interner: &Interner) -> Result<NetA
                 table_name: table_str.to_string(),
             })
         }
+        ActionStmt::For { var, range, body } => {
+            let var_str = interner.get(*var).to_string();
+            validate_identifier(&var_str)?;
+            let encoded_range = encode_expr(range, interner)?;
+            let mut encoded_body = Vec::new();
+            for s in body {
+                encoded_body.push(encode_action_stmt(s, interner)?);
+            }
+            Ok(NetActionStmt::For {
+                var: var_str,
+                range: encoded_range,
+                body: encoded_body,
+            })
+        }
     }
 }
 
@@ -706,6 +774,19 @@ pub fn decode_action_stmt(stmt: NetActionStmt, interner: &mut Interner) -> Resul
             Ok(ActionStmt::Insert {
                 row: decode_expr(row, interner)?,
                 table_name: interner.insert(&table_name),
+            })
+        }
+        NetActionStmt::For { var, range, body } => {
+            validate_identifier(&var)?;
+            let decoded_range = decode_expr(range, interner)?;
+            let mut decoded_body = Vec::new();
+            for s in body {
+                decoded_body.push(decode_action_stmt(s, interner)?);
+            }
+            Ok(ActionStmt::For {
+                var: interner.insert(&var),
+                range: decoded_range,
+                body: decoded_body,
             })
         }
     }

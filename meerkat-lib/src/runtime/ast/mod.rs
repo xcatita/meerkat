@@ -49,6 +49,11 @@ pub enum ActionStmt {
         row: Expr,
         table_name: Symbol,
     },
+    For {
+        var: Symbol,
+        range: Expr,
+        body: Vec<ActionStmt>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -112,6 +117,25 @@ pub enum Value {
         /// where the closure is later used
         service_net_id: ServiceNetId,
     },
+    List {
+        vals: Vec<Value>,
+    },
+    Range {
+        start: i32,
+        end: i32,
+    },
+}
+
+impl Value {
+    pub fn to_list_elements(&self) -> Option<Vec<Value>> {
+        match self {
+            Value::List { vals } => Some(vals.clone()),
+            Value::Range { start, end } => {
+                Some((*start..*end).map(|v| Value::Int { val: v }).collect())
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -190,6 +214,11 @@ pub enum Expr {
         column_name: Symbol,
         operation: Box<Expr>,
         identity: Box<Expr>,
+    },
+    List(Vec<Expr>),
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
     },
 }
 
@@ -302,6 +331,26 @@ impl Display for Value {
                     env_str, service_net_id.0, stmts
                 )
             }
+            Value::List { vals } => {
+                write!(f, "[")?;
+                for (i, val) in vals.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", val)?;
+                }
+                write!(f, "]")
+            }
+            Value::Range { start, end } => {
+                write!(f, "[")?;
+                for (i, val) in (*start..*end).enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", val)?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -389,6 +438,19 @@ impl Display for Expr {
                 write!(f, "]")
             }
             Expr::Fold { .. } => write!(f, "fold"),
+            Expr::List(exprs) => {
+                write!(f, "[")?;
+                for (i, expr) in exprs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", expr)?;
+                }
+                write!(f, "]")
+            }
+            Expr::Range { start, end } => {
+                write!(f, "{}..{}", start, end)
+            }
         }
     }
 }
@@ -419,6 +481,13 @@ impl Display for ActionStmt {
             ActionStmt::Assign { name, expr } => write!(f, "{} = {}", name, expr),
             ActionStmt::Insert { row, table_name } => {
                 write!(f, "insert into {} {}", table_name, row)
+            }
+            ActionStmt::For { var, range, body } => {
+                write!(f, "for {} in {} {{ ", var, range)?;
+                for stmt in body {
+                    write!(f, "{}; ", stmt)?;
+                }
+                write!(f, "}}")
             }
         }
     }
