@@ -29,8 +29,8 @@ pub enum Type {
 /// reusable. Using standard `HashMap` inside `Env` is more performant,
 /// and separating ordering concerns leads to a simpler design overall
 #[derive(Debug, Clone)]
-pub struct ServiceType {
-    pub fields: Env<'static, Type>,
+pub struct ServiceType<'a> {
+    pub fields: Env<'a, Type>,
     pub field_order: Vec<Symbol>,
 }
 
@@ -39,7 +39,7 @@ pub struct ServiceType {
 // the `field_order` vector to ensure a deterministic, order-respecting
 // field equality check. This enables the live update system to compare
 // new and old service signatures to detect schema changes
-impl PartialEq for ServiceType {
+impl<'a> PartialEq for ServiceType<'a> {
     fn eq(&self, other: &Self) -> bool {
         if self.field_order != other.field_order {
             return false;
@@ -57,13 +57,13 @@ impl PartialEq for ServiceType {
 
 // Implement `Eq` manually because the internal `Env` type cannot
 // derive `Eq` automatically due to its `HashMap` field
-impl Eq for ServiceType {}
+impl<'a> Eq for ServiceType<'a> {}
 
 // Implement `Hash` manually using the `field_order` vector to hash
 // service fields in a deterministic order. This resolves the lack
 // of a standard `Hash` implementation on `HashMap` and provides
 // stable keys for indexing service definitions
-impl Hash for ServiceType {
+impl<'a> Hash for ServiceType<'a> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.field_order.hash(state);
         for name in &self.field_order {

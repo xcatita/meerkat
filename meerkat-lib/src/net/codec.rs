@@ -258,7 +258,7 @@ pub fn encode_type(ty: &Type) -> Result<NetType> {
 ///
 /// Returns:
 ///     `Result<NetServiceType>`: The encoded network service type
-pub fn encode_servicetype(st: &ServiceType, interner: &Interner) -> Result<NetServiceType> {
+pub fn encode_servicetype<'a>(st: &ServiceType<'a>, interner: &Interner) -> Result<NetServiceType> {
     let mut fields = Vec::new();
     for name in &st.field_order {
         let name_str = interner.get(*name).to_string();
@@ -352,7 +352,10 @@ pub fn decode_type(ty: NetType) -> Result<Type> {
 ///
 /// Returns:
 ///     `Result<ServiceType>`: The decoded runtime service type
-pub fn decode_servicetype(nst: NetServiceType, interner: &mut Interner) -> Result<ServiceType> {
+pub fn decode_servicetype<'a>(
+    nst: NetServiceType,
+    interner: &mut Interner,
+) -> Result<ServiceType<'a>> {
     let mut fields = Env::new(None);
     let mut field_order = Vec::new();
     for (name_str, net_ty) in nst.fields {

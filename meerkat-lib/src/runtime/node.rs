@@ -13,12 +13,12 @@ use crate::runtime::tt::types::ServiceType;
 use crate::runtime::{Env, Manager};
 
 /// Root manager for compiling and executing a Meerkat node
-pub struct Node {
-    pub service_classes: Env<'static, ServiceType>,
+pub struct Node<'a> {
+    pub service_classes: Env<'a, ServiceType<'a>>,
     pub interner: Interner,
 }
 
-impl Node {
+impl<'a> Node<'a> {
     /// Create a new empty Node representing the process context
     pub fn new() -> Self {
         Node {
@@ -57,7 +57,7 @@ impl Node {
     }
 }
 
-impl Default for Node {
+impl<'a> Default for Node<'a> {
     /// Create a new empty Node representing the process context
     fn default() -> Self {
         Self::new()
