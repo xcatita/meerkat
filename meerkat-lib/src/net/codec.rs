@@ -1834,9 +1834,17 @@ mod service_code_tests {
         let encoded = encode_servicetype(&original_type, &interner).unwrap();
 
         let mut interner_new = Interner::new();
-        let decoded = decode_servicetype(encoded, &mut interner_new).unwrap();
+        let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
 
-        assert_eq!(original_type, decoded);
+        // Note: We re-encode to compare `NetServiceType` values
+        // instead of comparing the decoded runtime `ServiceType`
+        // instances directly. Runtime `ServiceType` equality
+        // depends on `Interner` `Symbol` IDs, which might
+        // misalign between the original and new `Interner`
+        // instances, causing brittle test failures. The
+        // `NetServiceType` correctly reflects network equivalence
+        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        assert_eq!(encoded, reencoded);
     }
 
     /// Verify round-trip encoding and decoding for an empty ServiceType (zero fields)
@@ -1849,9 +1857,17 @@ mod service_code_tests {
         assert!(encoded.fields.is_empty());
 
         let mut interner_new = Interner::new();
-        let decoded = decode_servicetype(encoded, &mut interner_new).unwrap();
+        let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
 
-        assert_eq!(original_type, decoded);
+        // Note: We re-encode to compare `NetServiceType` values
+        // instead of comparing the decoded runtime `ServiceType`
+        // instances directly. Runtime `ServiceType` equality
+        // depends on `Interner` `Symbol` IDs, which might
+        // misalign between the original and new `Interner`
+        // instances, causing brittle test failures. The
+        // `NetServiceType` correctly reflects network equivalence
+        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        assert_eq!(encoded, reencoded);
     }
 
     /// Verify round-trip encoding and decoding for a ServiceType with complex types (Tuple, Func)
@@ -1871,9 +1887,17 @@ mod service_code_tests {
         let encoded = encode_servicetype(&original_type, &interner).unwrap();
 
         let mut interner_new = Interner::new();
-        let decoded = decode_servicetype(encoded, &mut interner_new).unwrap();
+        let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
 
-        assert_eq!(original_type, decoded);
+        // Note: We re-encode to compare `NetServiceType` values
+        // instead of comparing the decoded runtime `ServiceType`
+        // instances directly. Runtime `ServiceType` equality
+        // depends on `Interner` `Symbol` IDs, which might
+        // misalign between the original and new `Interner`
+        // instances, causing brittle test failures. The
+        // `NetServiceType` correctly reflects network equivalence
+        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        assert_eq!(encoded, reencoded);
     }
 
     /// Verify that decode_servicetype returns an error if NetServiceType has duplicate field names
