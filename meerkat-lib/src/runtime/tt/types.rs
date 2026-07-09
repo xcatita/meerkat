@@ -30,8 +30,88 @@ pub enum Type {
 /// and separating ordering concerns leads to a simpler design overall
 #[derive(Debug, Clone)]
 pub struct ServiceType<'a> {
-    pub fields: Env<'a, Type>,
-    pub field_order: Vec<Symbol>,
+    fields: Env<'a, Type>,
+    field_order: Vec<Symbol>,
+}
+
+impl<'a> Default for ServiceType<'a> {
+    /// Create a new, empty `ServiceType`
+    ///
+    /// Returns:
+    ///     `Self`: The constructed empty `ServiceType`
+    fn default() -> Self {
+        Self {
+            fields: Env::new(None),
+            field_order: Vec::new(),
+        }
+    }
+}
+
+impl<'a> ServiceType<'a> {
+    /// Get a reference to the fields environment
+    ///
+    /// Returns:
+    ///     `&Env<'a, Type>`: Reference to the environment
+    pub fn fields(&self) -> &Env<'a, Type> {
+        &self.fields
+    }
+
+    /// Get a slice of the field symbols in declaration order
+    ///
+    /// Returns:
+    ///     `&[Symbol]`: The ordered symbols of the fields
+    pub fn field_order(&self) -> &[Symbol] {
+        &self.field_order
+    }
+
+    /// Add a field to the service type
+    ///
+    /// Args:
+    ///     `name` (`Symbol`): The symbol representing the field name
+    ///     `ty` (`Type`): The type of the field to add
+    ///
+    /// Returns:
+    ///     `Result<(), &'static str>`: Unit value on success, or an
+    ///     error if the field already exists
+    pub fn add_field(&mut self, name: Symbol, ty: Type) -> Result<(), &'static str> {
+        if self.fields.find(name).is_some() {
+            return Err("field already exists");
+        }
+        self.fields.bind(name, ty);
+        self.field_order.push(name);
+        Ok(())
+    }
+
+    /// Remove a field from the service type
+    ///
+    /// Args:
+    ///     `name` (`Symbol`): The symbol representing the field name
+    ///
+    /// Returns:
+    ///     `Option<Type>`: The removed field type if it existed
+    pub fn remove_field(&mut self, name: Symbol) -> Option<Type> {
+        let removed = self.fields.remove(name);
+        if removed.is_some() {
+            self.field_order.retain(|&x| x != name);
+        }
+        removed
+    }
+
+    /// Update an existing field in the service type
+    ///
+    /// Args:
+    ///     `name` (`Symbol`): The symbol representing the field name
+    ///     `ty` (`Type`): The new type for the field
+    ///
+    /// Returns:
+    ///     `Result<Option<Type>, &'static str>`: The old field type
+    ///     on success, or an error if the field did not exist
+    pub fn update_field(&mut self, name: Symbol, ty: Type) -> Result<Option<Type>, &'static str> {
+        if self.fields.find(name).is_none() {
+            return Err("field does not exist");
+        }
+        Ok(self.fields.bind(name, ty))
+    }
 }
 
 // Standard `HashMap` does not implement `Hash` or support ordered
@@ -40,6 +120,13 @@ pub struct ServiceType<'a> {
 // field equality check. This enables the live update system to compare
 // new and old service signatures to detect schema changes
 impl<'a> PartialEq for ServiceType<'a> {
+    /// Compare two `ServiceType` instances for equality
+    ///
+    /// Args:
+    ///     `other` (`&Self`): The other instance to compare
+    ///
+    /// Returns:
+    ///     `bool`: True if both instances are equal
     fn eq(&self, other: &Self) -> bool {
         if self.field_order != other.field_order {
             return false;
@@ -47,8 +134,9 @@ impl<'a> PartialEq for ServiceType<'a> {
         for name in &self.field_order {
             let ty_self = self.fields.find(*name);
             let ty_other = other.fields.find(*name);
-            if ty_self != ty_other {
-                return false;
+            match (ty_self, ty_other) {
+                (Some(ts), Some(to)) if ts == to => continue,
+                _ => return false,
             }
         }
         true
@@ -276,5 +364,78 @@ mod tests {
         assert_eq!(tuple.len(), 2);
         assert_eq!(tuple[0], Type::Int);
         assert_eq!(tuple[1], Type::String);
+    }
+
+    /// Verify that `ServiceType` encapsulation, mutators,
+    /// and `PartialEq` work as expected
+    #[test]
+    fn test_service_type_mutators_and_equality() {
+        let mut interner = crate::runtime::interner::Interner::new();
+        let field_a = interner.insert("a");
+        let field_b = interner.insert("b");
+
+        let mut st1 = ServiceType::default();
+        let mut st2 = ServiceType::default();
+
+        // Initially equal
+        assert_eq!(st1, st2);
+
+        // Add fields
+        assert!(st1.add_field(field_a, Type::Int).is_ok());
+        assert!(st1.add_field(field_b, Type::String).is_ok());
+
+        // Duplicate fields should error
+        assert!(st1.add_field(field_a, Type::Bool).is_err());
+
+        // st1 and st2 should not be equal now
+        assert_ne!(st1, st2);
+
+        // Make st2 match st1
+        assert!(st2.add_field(field_a, Type::Int).is_ok());
+        assert!(st2.add_field(field_b, Type::String).is_ok());
+        assert_eq!(st1, st2);
+
+        // Update a field
+        assert!(st1.update_field(field_a, Type::Bool).is_ok());
+        assert_ne!(st1, st2);
+
+        // Updating non-existent field should error
+        let field_c = interner.insert("c");
+        assert!(st1.update_field(field_c, Type::Int).is_err());
+
+        // Revert update
+        assert!(st1.update_field(field_a, Type::Int).is_ok());
+        assert_eq!(st1, st2);
+
+        // Remove a field
+        assert_eq!(st1.remove_field(field_b), Some(Type::String));
+        assert_ne!(st1, st2);
+
+        // Removing non-existent field should return None
+        assert_eq!(st1.remove_field(field_c), None);
+    }
+
+    /// Verify that `ServiceType::eq` correctly handles missing
+    /// entries by treating them as unequal, preventing equality
+    /// when the internal state is invalid or corrupted
+    #[test]
+    fn test_corrupted_service_type_equality() {
+        let mut interner = crate::runtime::interner::Interner::new();
+        let field_a = interner.insert("a");
+
+        // Construct two ServiceType instances with a field in
+        // field_order but missing from the fields map
+        let st1 = ServiceType {
+            fields: Env::new(None),
+            field_order: vec![field_a],
+        };
+        let st2 = ServiceType {
+            fields: Env::new(None),
+            field_order: vec![field_a],
+        };
+
+        // Previously, st1 == st2 would be true (None == None)
+        // With our fix, it must be false
+        assert_ne!(st1, st2);
     }
 }

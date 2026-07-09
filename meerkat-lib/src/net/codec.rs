@@ -15,7 +15,6 @@ use crate::runtime::limits::{
     MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
 use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
-use crate::runtime::Env;
 
 fn validate_identifier(s: &str) -> Result<()> {
     if s.len() > MAX_IDENTIFIER_LENGTH {
@@ -260,14 +259,14 @@ pub fn encode_type(ty: &Type) -> Result<NetType> {
 ///     `Result<NetServiceType>`: The encoded network service type
 pub fn encode_servicetype<'a>(st: &ServiceType<'a>, interner: &Interner) -> Result<NetServiceType> {
     let mut fields = Vec::new();
-    for name in &st.field_order {
+    for name in st.field_order() {
         let name_str = interner.get(*name).to_string();
         debug_assert!(
-            st.fields.find(*name).is_some(),
+            st.fields().find(*name).is_some(),
             "field_order entry missing from fields map: {}",
             name_str
         );
-        if let Some(field_ty) = st.fields.find(*name) {
+        if let Some(field_ty) = st.fields().find(*name) {
             let net_ty = encode_type(field_ty)?;
             fields.push((name_str, net_ty));
         }
@@ -356,24 +355,19 @@ pub fn decode_servicetype<'a>(
     nst: NetServiceType,
     interner: &mut Interner,
 ) -> Result<ServiceType<'a>> {
-    let mut fields = Env::new(None);
-    let mut field_order = Vec::new();
+    let mut st = ServiceType::default();
     for (name_str, net_ty) in nst.fields {
         validate_identifier(&name_str)?;
         let sym = interner.insert(&name_str);
         let ty = decode_type(net_ty)?;
-        if fields.bind(sym, ty).is_some() {
-            return Err(Error::Message(format!(
+        st.add_field(sym, ty).map_err(|_| {
+            Error::Message(format!(
                 "duplicate field name '{}' in ServiceType",
                 name_str
-            )));
-        }
-        field_order.push(sym);
+            ))
+        })?;
     }
-    Ok(ServiceType {
-        fields,
-        field_order,
-    })
+    Ok(st)
 }
 
 /// Encode a runtime `Param` into a network representation
@@ -1833,14 +1827,9 @@ mod service_code_tests {
         let field_a = interner.insert("a");
         let field_b = interner.insert("b");
 
-        let mut fields = Env::new(None);
-        fields.bind(field_a, Type::Int);
-        fields.bind(field_b, Type::String);
-
-        let original_type = ServiceType {
-            fields,
-            field_order: vec![field_a, field_b],
-        };
+        let mut original_type = ServiceType::default();
+        original_type.add_field(field_a, Type::Int).unwrap();
+        original_type.add_field(field_b, Type::String).unwrap();
 
         let encoded = encode_servicetype(&original_type, &interner).unwrap();
 
@@ -1854,12 +1843,7 @@ mod service_code_tests {
     #[test]
     fn test_codec_service_type_empty_roundtrip() {
         let interner = Interner::new();
-        let fields = Env::new(None);
-
-        let original_type = ServiceType {
-            fields,
-            field_order: vec![],
-        };
+        let original_type = ServiceType::default();
 
         let encoded = encode_servicetype(&original_type, &interner).unwrap();
         assert!(encoded.fields.is_empty());
@@ -1877,17 +1861,12 @@ mod service_code_tests {
         let field_tuple = interner.insert("t");
         let field_func = interner.insert("f");
 
-        let mut fields = Env::new(None);
         let tuple_ty = Type::Tuple(TupleType::new(vec![Type::Int, Type::String]).unwrap());
         let func_ty = Type::Func(Box::new(Type::Bool), Box::new(Type::Unit));
 
-        fields.bind(field_tuple, tuple_ty);
-        fields.bind(field_func, func_ty);
-
-        let original_type = ServiceType {
-            fields,
-            field_order: vec![field_tuple, field_func],
-        };
+        let mut original_type = ServiceType::default();
+        original_type.add_field(field_tuple, tuple_ty).unwrap();
+        original_type.add_field(field_func, func_ty).unwrap();
 
         let encoded = encode_servicetype(&original_type, &interner).unwrap();
 
