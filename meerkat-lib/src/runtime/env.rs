@@ -57,8 +57,8 @@ impl<'a, T> Env<'a, T> {
     ///     `name` (`Symbol`): The symbol to search
     ///
     /// Returns:
-    ///     `Option<&'a T>`: Reference to the value if found
-    pub fn find(&'a self, name: Symbol) -> Option<&'a T> {
+    ///     `Option<&T>`: Reference to the value if found
+    pub fn find(&self, name: Symbol) -> Option<&T> {
         if let Some(val) = self.bindings.get(&name) {
             Some(val)
         } else if let Some(parent) = self.parent {
@@ -74,8 +74,8 @@ impl<'a, T> Env<'a, T> {
     ///     `name` (`Symbol`): The symbol to search
     ///
     /// Returns:
-    ///     `Option<(&'a Env<'a, T>, &'a T)>`: The environment and the value
-    pub fn find_with_env(&'a self, name: Symbol) -> Option<(&'a Env<'a, T>, &'a T)> {
+    ///     `Option<(&Env<'a, T>, &T)>`: The environment and the value
+    pub fn find_with_env(&self, name: Symbol) -> Option<(&Env<'a, T>, &T)> {
         if let Some(val) = self.bindings.get(&name) {
             Some((self, val))
         } else if let Some(parent) = self.parent {
@@ -153,5 +153,21 @@ mod tests {
         let child = Env::new(Some(&parent));
         assert_eq!(child.find(s), None);
         assert!(child.find_with_env(s).is_none());
+    }
+
+    #[test]
+    /// Verify that `Env::find` compiles when borrowing a stack
+    /// environment with a parent reference of lifetime `'a`
+    fn test_unit_env_stack_borrow_with_parent_lifetime() {
+        let mut parent = Env::new(None);
+        let s = Symbol::empty();
+        parent.bind(s, 42);
+
+        fn helper<'a>(parent: &'a Env<'a, i32>, s: Symbol) -> Option<i32> {
+            let child = Env::new(Some(parent));
+            child.find(s).copied()
+        }
+
+        assert_eq!(helper(&parent, s), Some(42));
     }
 }
