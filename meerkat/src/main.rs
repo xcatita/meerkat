@@ -307,7 +307,12 @@ async fn run_server(
     // #39: browser (wasm) clients can only speak WebSocket, so listen on a
     // second address for them. The TCP address above stays canonical: native
     // peers dial it, and it is what service URLs and reply addresses use.
-    let ws_port = ws_port.unwrap_or(port + 1);
+    let ws_port = match ws_port {
+        Some(p) => p,
+        None => port
+            .checked_add(1)
+            .ok_or("port 65535 has no room for a default WebSocket port; pass --ws-port")?,
+    };
     let ws_listen_addr = Address::new(format!("/ip4/{}/tcp/{}/ws", listen_ip, ws_port));
     let ws_reply = net
         .handle_command(NetworkCommand::Listen {
