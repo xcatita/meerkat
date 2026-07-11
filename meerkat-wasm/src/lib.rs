@@ -43,7 +43,7 @@ fn current_html(
     manager: &Manager,
     html_sym: meerkat_lib::runtime::interner::Symbol,
 ) -> Option<String> {
-    for (_, svc) in manager.services.iter() {
+    for svc in manager.services.values() {
         if let Some(vs) = svc.vars.get(&html_sym) {
             if let Value::Html(h) = &vs.value {
                 return Some(h.to_string());
