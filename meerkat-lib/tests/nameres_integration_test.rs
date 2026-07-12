@@ -888,3 +888,50 @@ fn test_integration_complex_arbitrary_order_resolution() {
     let res = resolve(&stmts);
     assert!(res.is_ok());
 }
+
+/// Verify that accessing a non-existent member on a local service returns UnknownIdentifier
+#[test]
+fn test_integration_local_member_access_misspelled() {
+    let mut interner = Interner::new();
+    let input = "
+        service s1 {
+            var x = 1;
+        }
+        service s2 {
+            pub def y = s1.misspelled;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    let s1 = interner.insert("s1");
+    let misspelled = interner.insert("misspelled");
+    assert_eq!(
+        res,
+        Err(Error::UnknownIdentifier {
+            name: misspelled,
+            expected: ExpectedSort::Variable,
+            context_name: Some(s1),
+        })
+    );
+}
+
+/// Verify that accessing a valid member on a local service succeeds
+#[test]
+fn test_integration_local_member_access_valid() {
+    let mut interner = Interner::new();
+    let input = "
+        service s1 {
+            var x = 1;
+        }
+        service s2 {
+            pub def y = s1.x;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}

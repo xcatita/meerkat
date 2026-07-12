@@ -100,14 +100,19 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// The stateful struct that drives static name resolution traversal
-#[derive(Default)]
-pub struct Resolver {
+pub struct Resolver<'a> {
     depth: usize,
-    service_members: HashMap<Symbol, Vec<Symbol>>,
+    local_services: HashMap<Symbol, &'a [Decl]>,
     current_context: Option<Symbol>,
 }
 
-impl Resolver {
+impl<'a> Default for Resolver<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> Resolver<'a> {
     /// Creates a new resolver instance
     ///
     /// Returns:
@@ -115,7 +120,7 @@ impl Resolver {
     pub fn new() -> Self {
         Self {
             depth: 0,
-            service_members: HashMap::new(),
+            local_services: HashMap::new(),
             current_context: None,
         }
     }
@@ -124,34 +129,23 @@ impl Resolver {
     /// of `Stmt`s
     ///
     /// Args:
-    ///     `stmts` (`&[Stmt]`): The statements of the program
+    ///     `stmts` (`&'a [Stmt]`): The statements of the program
     ///     `env` (`&mut Env<'_, ()>`): The current scope environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    pub fn resolve_program(&mut self, stmts: &[Stmt], env: &mut Env<'_, ()>) -> Result<(), Error> {
-        // Pass 1: Bind top-level services and imports, and extract
-        // service members. This pre-pass registers all service names
-        // and populates `service_members` before evaluating any
-        // expressions in the second pass. This allows services to
-        // refer to each other's names out-of-order, and lets `@test`
-        // blocks resolve variables of their target services even if
-        // the test is defined before the service
+    pub fn resolve_program(
+        &mut self,
+        stmts: &'a [Stmt],
+        env: &mut Env<'_, ()>,
+    ) -> Result<(), Error> {
+        // Pass 1: Bind top-level services and imports, and record
+        // local service declarations.
         for stmt in stmts {
             match stmt {
                 Stmt::Service { name, decls } => {
                     env.bind(*name, ());
-                    let mut members = Vec::new();
-                    for decl in decls {
-                        match decl {
-                            Decl::VarDecl { name: mem, .. }
-                            | Decl::DefDecl { name: mem, .. }
-                            | Decl::TableDecl { name: mem, .. } => {
-                                members.push(*mem);
-                            }
-                        }
-                    }
-                    self.service_members.insert(*name, members);
+                    self.local_services.insert(*name, decls);
                 }
                 Stmt::Import { service_name, .. } => {
                     env.bind(*service_name, ());
@@ -174,12 +168,12 @@ impl Resolver {
     /// Resolves name bindings in a single statement
     ///
     /// Args:
-    ///     `stmt` (`&Stmt`): The statement to resolve
+    ///     `stmt` (`&'a Stmt`): The statement to resolve
     ///     `env` (`&mut Env<'_, ()>`): The current scope environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_stmt(&mut self, stmt: &Stmt, env: &mut Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_stmt(&mut self, stmt: &'a Stmt, env: &mut Env<'_, ()>) -> Result<(), Error> {
         match stmt {
             Stmt::ActionStmt(action) => self.resolve_action_stmt(action, env),
             Stmt::Update { .. } => Err(Error::UpdateResolutionUnimplemented),
@@ -214,10 +208,16 @@ impl Resolver {
                 let prev_context = self.current_context;
                 self.current_context = Some(*service_name);
                 let mut test_env = Env::new(Some(env));
-                match self.service_members.get(service_name) {
-                    Some(members) => {
-                        for member in members {
-                            test_env.bind(*member, ());
+                match self.local_services.get(service_name) {
+                    Some(decls) => {
+                        for decl in *decls {
+                            match decl {
+                                Decl::VarDecl { name: mem, .. }
+                                | Decl::DefDecl { name: mem, .. }
+                                | Decl::TableDecl { name: mem, .. } => {
+                                    test_env.bind(*mem, ());
+                                }
+                            }
                         }
                     }
                     None => {
@@ -242,12 +242,12 @@ impl Resolver {
     /// declarations and avoid leaking them to the outer scope
     ///
     /// Args:
-    ///     `decls` (`&[Decl]`): The declarations in the service
+    ///     `decls` (`&'a [Decl]`): The declarations in the service
     ///     `env` (`&mut Env<'_, ()>`): The service-level environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_service(&mut self, decls: &[Decl], env: &mut Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_service(&mut self, decls: &'a [Decl], env: &mut Env<'_, ()>) -> Result<(), Error> {
         for decl in decls {
             match decl {
                 Decl::VarDecl { name, ty: _, val } => {
@@ -274,14 +274,14 @@ impl Resolver {
     /// Resolves a list of action statements sequentially
     ///
     /// Args:
-    ///     `stmts` (`&[ActionStmt]`): The action statements to resolve
+    ///     `stmts` (`&'a [ActionStmt]`): The action statements to resolve
     ///     `env` (`&mut Env<'_, ()>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
     fn resolve_action_stmts(
         &mut self,
-        stmts: &[ActionStmt],
+        stmts: &'a [ActionStmt],
         env: &mut Env<'_, ()>,
     ) -> Result<(), Error> {
         for stmt in stmts {
@@ -293,14 +293,14 @@ impl Resolver {
     /// Resolves a single action statement
     ///
     /// Args:
-    ///     `stmt` (`&ActionStmt`): The action statement to resolve
+    ///     `stmt` (`&'a ActionStmt`): The action statement to resolve
     ///     `env` (`&mut Env<'_, ()>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
     fn resolve_action_stmt(
         &mut self,
-        stmt: &ActionStmt,
+        stmt: &'a ActionStmt,
         env: &mut Env<'_, ()>,
     ) -> Result<(), Error> {
         match stmt {
@@ -354,12 +354,12 @@ impl Resolver {
     /// Resolves variable names within an expression
     ///
     /// Args:
-    ///     `expr` (`&Expr`): The expression to resolve
+    ///     `expr` (`&'a Expr`): The expression to resolve
     ///     `env` (`&Env<'_, ()>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_expr(&mut self, expr: &Expr, env: &Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_expr(&mut self, expr: &'a Expr, env: &Env<'_, ()>) -> Result<(), Error> {
         match expr {
             Expr::Literal { val } => self.resolve_value(val, env),
             Expr::Html(template) => {
@@ -372,8 +372,14 @@ impl Resolver {
                 if env.find(*name).is_none() {
                     let is_local_member = self
                         .current_context
-                        .and_then(|ctx| self.service_members.get(&ctx))
-                        .is_some_and(|members| members.contains(name));
+                        .and_then(|ctx| self.local_services.get(&ctx))
+                        .is_some_and(|decls| {
+                            decls.iter().any(|decl| match decl {
+                                Decl::VarDecl { name: mem, .. }
+                                | Decl::DefDecl { name: mem, .. }
+                                | Decl::TableDecl { name: mem, .. } => mem == name,
+                            })
+                        });
 
                     if is_local_member {
                         if self.depth == 0 {
@@ -436,14 +442,31 @@ impl Resolver {
             }
             Expr::MemberAccess {
                 service_name,
-                member_name: _,
+                member_name,
             } => {
-                if env.find(*service_name).is_none() {
+                if let Some(decls) = self.local_services.get(service_name) {
+                    let has_member = decls.iter().any(|decl| match decl {
+                        Decl::VarDecl { name: mem, .. }
+                        | Decl::DefDecl { name: mem, .. }
+                        | Decl::TableDecl { name: mem, .. } => mem == member_name,
+                    });
+                    if !has_member {
+                        return Err(Error::UnknownIdentifier {
+                            name: *member_name,
+                            expected: ExpectedSort::Variable,
+                            context_name: Some(*service_name),
+                        });
+                    }
+                } else if env.find(*service_name).is_none() {
                     return Err(Error::UnknownIdentifier {
                         name: *service_name,
                         expected: ExpectedSort::Service,
                         context_name: self.current_context,
                     });
+                } else {
+                    // This is an imported service. We defer name resolution and type checking
+                    // of imported programs until a future patch, as required by Issue 34
+                    // "type checking for self-contained programs".
                 }
                 Ok(())
             }
@@ -499,12 +522,12 @@ impl Resolver {
     /// Resolves variable names within a value
     ///
     /// Args:
-    ///     `val` (`&Value`): The value to resolve
+    ///     `val` (`&'a Value`): The value to resolve
     ///     `env` (`&Env<'_, ()>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_value(&mut self, val: &Value, env: &Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_value(&mut self, val: &'a Value, env: &Env<'_, ()>) -> Result<(), Error> {
         match val {
             Value::Int { val: _ } => Ok(()),
             Value::Bool { val: _ } => Ok(()),
@@ -545,7 +568,7 @@ impl Resolver {
     ///
     /// Args:
     ///     `params` (`&[Param]`): The function parameters
-    ///     `body` (`&Expr`): The body expression to resolve
+    ///     `body` (`&'a Expr`): The body expression to resolve
     ///     `env` (`&Env<'_, ()>`): The parent environment
     ///
     /// Returns:
@@ -553,7 +576,7 @@ impl Resolver {
     fn resolve_function_body(
         &mut self,
         params: &[Param],
-        body: &Expr,
+        body: &'a Expr,
         env: &Env<'_, ()>,
     ) -> Result<(), Error> {
         if self.depth >= MAX_SCOPE_DEPTH {
