@@ -67,6 +67,13 @@ pub async fn load_service(server_ws_addr: String, path: String) -> Result<String
     manager.network = Some(net);
     manager.set_local_address(format!("/p2p/{}", peer_id));
 
+    // Browsers can only dial WebSocket transports. Reject a non-ws multiaddr
+    // early (e.g. the TCP "Server listening at" address) with a clear message.
+    if !server_ws_addr.contains("/ws") {
+        return Err(js_err(
+            "Expected a WebSocket address containing /ws, e.g. /ip4/127.0.0.1/tcp/9001/ws/p2p/<peer_id>",
+        ));
+    }
     let server_addr = Address::new(server_ws_addr);
 
     // 1. Fetch source.

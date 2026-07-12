@@ -33,14 +33,9 @@
           document.getElementById("addr").value,
           document.getElementById("path").value
         );
-        const marker = "\n---HTML---\n";
-        const idx = src.indexOf(marker);
-        if (idx >= 0) {
-          out.textContent = src.slice(0, idx);
-          document.getElementById("render").innerHTML = src.slice(idx + marker.length);
-        } else {
-          out.textContent = src;
-        }
+        // load_service returns a textual summary; it writes the rendered
+        // html def directly to #render via web-sys.
+        out.textContent = src;
       } catch (e) {
         out.textContent = "error: " + e;
       }
