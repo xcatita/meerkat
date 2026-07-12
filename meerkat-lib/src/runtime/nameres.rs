@@ -133,15 +133,13 @@ impl Resolver {
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
     pub fn resolve_program(&mut self, stmts: &[Stmt], env: &mut Env<'_, ()>) -> Result<(), Error> {
-        // Pass 1: Hoist top-level services and imports, and extract
-        // service members. This pre-pass is required to support
-        // mutually-referential services defined in arbitrary order.
-        // By registering all service names and extracting their
-        // fields into `service_members` before resolving
-        // expressions in the second pass, services can refer to
-        // each other out-of-order, and `@test` blocks can resolve
-        // variables of their target services even if the test is
-        // defined before the service
+        // Pass 1: Bind top-level services and imports, and extract
+        // service members. This pre-pass registers all service names
+        // and populates `service_members` before evaluating any
+        // expressions in the second pass. This allows services to
+        // refer to each other's names out-of-order, and lets `@test`
+        // blocks resolve variables of their target services even if
+        // the test is defined before the service
         for stmt in stmts {
             match stmt {
                 Stmt::Service { name, decls } => {
@@ -238,12 +236,13 @@ impl Resolver {
         }
     }
 
-    /// Resolves service-level declarations using a two-pass approach
+    /// Resolves service-level declarations sequentially in a single
+    /// pass
     ///
-    /// WARNING: This method hoists all declarations into the
-    /// provided `env`. Callers must ensure they pass a scoped child
-    /// environment if they intend to encapsulate these declarations
-    /// and avoid leaking them to the outer scope
+    /// This method binds each declaration into the provided `env` in
+    /// the order they are defined. Callers must ensure they pass a
+    /// scoped child environment if they intend to encapsulate these
+    /// declarations and avoid leaking them to the outer scope
     ///
     /// Args:
     ///     `decls` (`&[Decl]`): The declarations in the service
