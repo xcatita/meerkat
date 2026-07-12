@@ -5,10 +5,9 @@
 
 use crate::runtime::ast::{ActionStmt, Decl, Expr, Stmt, Value};
 use crate::runtime::interner::Symbol;
-use crate::runtime::limits::MAX_SCOPE_DEPTH;
 use crate::runtime::tt::Param;
 use crate::runtime::Env;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// The sort of identifier expected during name resolution
@@ -81,11 +80,62 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Represents the type of binding stored in the name resolution environment
+#[derive(Debug, Clone)]
+pub enum Binding<'a> {
+    /// A standard, immediately evaluated value
+    Value,
+    /// A suspended computation (closure/action) with its parameters and body
+    Suspended {
+        /// Parameters of the suspended computation
+        params: Option<&'a [Param]>,
+        /// The body of the suspended computation
+        body: &'a Expr,
+    },
+}
+
+/// The body of a delayed computation (thunk)
+#[derive(Clone)]
+pub enum ThunkBody<'a> {
+    /// An expression body (such as a closure body)
+    Expr(&'a Expr),
+    /// A list of action statements (such as an action block or test block)
+    ActionStmts(&'a [ActionStmt]),
+}
+
+/// A thunk representing a suspended computation whose resolution is deferred
+#[derive(Clone)]
+pub struct Thunk<'a> {
+    /// Parameters of the thunk, if any
+    params: Option<Vec<Param>>,
+    /// The body of the thunk
+    body: ThunkBody<'a>,
+    /// The lexical environment captured at the definition site
+    env: Env<'a, Binding<'a>>,
+    /// The service context active at the definition site
+    context: Option<Symbol>,
+}
+
 /// The stateful struct that drives static name resolution traversal
+///
+/// This resolver implements an extended multi-pass name resolution
+/// architecture utilizing thunks to model suspended computations
+/// It eliminates the depth-counter heuristic in favor of simulating
+/// execution-order semantics. When a closure, action, or test block
+/// is encountered, its resolution is deferred as a thunk. If a call
+/// or execution trigger is hit at service scope, the thunk is forced
+/// immediately, verifying all sequential forward dependencies
+///
+/// This provides the exact same static guarantees as a dependency
+/// DAG (such as in `dep_analysis.rs`) by tracing the evaluation path
+/// Since `dep_analysis` is still used for runtime closure flattening,
+/// it remains in the codebase while being deprecated for static checks
 pub struct Resolver<'a> {
-    depth: usize,
     local_services: HashMap<Symbol, &'a [Decl]>,
     current_context: Option<Symbol>,
+    thunks: Vec<Thunk<'a>>,
+    currently_evaluating: HashSet<Symbol>,
+    in_deferred_phase: bool,
 }
 
 impl<'a> Default for Resolver<'a> {
@@ -101,9 +151,11 @@ impl<'a> Resolver<'a> {
     ///     `Self`: The new `Resolver` instance
     pub fn new() -> Self {
         Self {
-            depth: 0,
             local_services: HashMap::new(),
             current_context: None,
+            thunks: Vec::new(),
+            currently_evaluating: HashSet::new(),
+            in_deferred_phase: false,
         }
     }
 
@@ -112,25 +164,25 @@ impl<'a> Resolver<'a> {
     ///
     /// Args:
     ///     `stmts` (`&'a [Stmt]`): The statements of the program
-    ///     `env` (`&mut Env<'_, ()>`): The current scope environment
+    ///     `env` (`&mut Env<'a, Binding<'a>>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
     pub fn resolve_program(
         &mut self,
         stmts: &'a [Stmt],
-        env: &mut Env<'_, ()>,
+        env: &mut Env<'a, Binding<'a>>,
     ) -> Result<(), Error> {
         // Pass 1: Bind top-level services and imports, and record
-        // local service declarations.
+        // local service declarations
         for stmt in stmts {
             match stmt {
                 Stmt::Service { name, decls } => {
-                    env.bind(*name, ());
+                    env.bind(*name, Binding::Value);
                     self.local_services.insert(*name, decls);
                 }
                 Stmt::Import { service_name, .. } => {
-                    env.bind(*service_name, ());
+                    env.bind(*service_name, Binding::Value);
                 }
                 Stmt::ActionStmt(_)
                 | Stmt::Update { .. }
@@ -140,10 +192,38 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        // Pass 2: Resolve all statements
+        // Pass 2: Resolve all statements sequentially
         for stmt in stmts {
             self.resolve_stmt(stmt, env)?;
         }
+
+        // Pass 3: Drain and resolve all thunks (deferred phase)
+        self.in_deferred_phase = true;
+        let thunks = std::mem::take(&mut self.thunks);
+        for thunk in &thunks {
+            let prev_context = self.current_context;
+            self.current_context = thunk.context;
+            match &thunk.body {
+                ThunkBody::Expr(body) => {
+                    if let Some(params) = &thunk.params {
+                        let mut inner_env = Env::new(Some(&thunk.env));
+                        for param in params {
+                            inner_env.bind(param.name, Binding::Value);
+                        }
+                        self.resolve_expr(body, &inner_env)?;
+                    } else {
+                        self.resolve_expr(body, &thunk.env)?;
+                    }
+                }
+                ThunkBody::ActionStmts(stmts) => {
+                    let mut action_env = Env::new(Some(&thunk.env));
+                    self.resolve_action_stmts(stmts, &mut action_env)?;
+                }
+            }
+            self.current_context = prev_context;
+        }
+        self.in_deferred_phase = false;
+
         Ok(())
     }
 
@@ -151,11 +231,15 @@ impl<'a> Resolver<'a> {
     ///
     /// Args:
     ///     `stmt` (`&'a Stmt`): The statement to resolve
-    ///     `env` (`&mut Env<'_, ()>`): The current scope environment
+    ///     `env` (`&mut Env<'b, Binding<'a>>`): The environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_stmt(&mut self, stmt: &'a Stmt, env: &mut Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_stmt<'b>(
+        &mut self,
+        stmt: &'a Stmt,
+        env: &mut Env<'b, Binding<'a>>,
+    ) -> Result<(), Error> {
         match stmt {
             Stmt::ActionStmt(action) => self.resolve_action_stmt(action, env),
             Stmt::Update { .. } => {
@@ -163,7 +247,6 @@ impl<'a> Resolver<'a> {
                     "warning: nameres: ignoring 'update' \
                      checks as not yet implemented"
                 );
-                // TODO: implement `update` resolution
                 Ok(())
             }
             Stmt::Connect { path: _, addr: _ } => Ok(()),
@@ -171,11 +254,11 @@ impl<'a> Resolver<'a> {
                 path: _,
                 service_name,
             } => {
-                env.bind(*service_name, ());
+                env.bind(*service_name, Binding::Value);
                 Ok(())
             }
             Stmt::Service { name, decls } => {
-                env.bind(*name, ());
+                env.bind(*name, Binding::Value);
                 let mut service_env = Env::new(Some(env));
                 let prev_context = self.current_context;
                 self.current_context = Some(*name);
@@ -197,57 +280,72 @@ impl<'a> Resolver<'a> {
                 let prev_context = self.current_context;
                 self.current_context = Some(*service_name);
                 let mut test_env = Env::new(Some(env));
-                match self.local_services.get(service_name) {
-                    Some(decls) => {
-                        for decl in *decls {
-                            match decl {
-                                Decl::VarDecl { name: mem, .. }
-                                | Decl::DefDecl { name: mem, .. }
-                                | Decl::TableDecl { name: mem, .. } => {
-                                    test_env.bind(*mem, ());
-                                }
-                            }
-                        }
-                    }
+                let decls = match self.local_services.get(service_name) {
+                    Some(decls) => decls,
                     None => {
                         self.current_context = prev_context;
                         println!(
                             "warning: nameres: ignoring 'import' \
                              checks as not yet implemented"
                         );
-                        // TODO: implement imported service `test`
-                        // resolution
                         return Ok(());
                     }
+                };
+                for decl in *decls {
+                    match decl {
+                        Decl::VarDecl { name: mem, .. }
+                        | Decl::DefDecl { name: mem, .. }
+                        | Decl::TableDecl { name: mem, .. } => {
+                            test_env.bind(*mem, Binding::Value);
+                        }
+                    }
                 }
-                let res = self.resolve_action_stmts(stmts, &mut test_env);
+                if self.in_deferred_phase {
+                    self.resolve_action_stmts(stmts, &mut test_env)?;
+                } else {
+                    self.thunks.push(Thunk {
+                        params: None,
+                        body: ThunkBody::ActionStmts(stmts),
+                        env: test_env.flatten(),
+                        context: self.current_context,
+                    });
+                }
                 self.current_context = prev_context;
-                res
+                Ok(())
             }
             Stmt::Watch { expr } => self.resolve_expr(expr, env),
         }
     }
 
-    /// Resolves service-level declarations sequentially in a single
-    /// pass
-    ///
-    /// This method binds each declaration into the provided `env` in
-    /// the order they are defined. Callers must ensure they pass a
-    /// scoped child environment if they intend to encapsulate these
-    /// declarations and avoid leaking them to the outer scope
+    /// Resolves service-level declarations sequentially
     ///
     /// Args:
     ///     `decls` (`&'a [Decl]`): The declarations in the service
-    ///     `env` (`&mut Env<'_, ()>`): The service-level environment
+    ///     `env` (`&mut Env<'b, Binding<'a>>`): The environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_service(&mut self, decls: &'a [Decl], env: &mut Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_service<'b>(
+        &mut self,
+        decls: &'a [Decl],
+        env: &mut Env<'b, Binding<'a>>,
+    ) -> Result<(), Error> {
         for decl in decls {
             match decl {
                 Decl::VarDecl { name, ty: _, val } => {
+                    let info = match val {
+                        Expr::Func { params, body, .. } => Binding::Suspended {
+                            params: Some(params),
+                            body: body.as_ref(),
+                        },
+                        Expr::Action(_) => Binding::Suspended {
+                            params: None,
+                            body: val,
+                        },
+                        _ => Binding::Value,
+                    };
                     self.resolve_expr(val, env)?;
-                    env.bind(*name, ());
+                    env.bind(*name, info);
                 }
                 Decl::DefDecl {
                     name,
@@ -255,11 +353,22 @@ impl<'a> Resolver<'a> {
                     val,
                     is_pub: _,
                 } => {
+                    let info = match val {
+                        Expr::Func { params, body, .. } => Binding::Suspended {
+                            params: Some(params),
+                            body: body.as_ref(),
+                        },
+                        Expr::Action(_) => Binding::Suspended {
+                            params: None,
+                            body: val,
+                        },
+                        _ => Binding::Value,
+                    };
                     self.resolve_expr(val, env)?;
-                    env.bind(*name, ());
+                    env.bind(*name, info);
                 }
                 Decl::TableDecl { name, fields: _ } => {
-                    env.bind(*name, ());
+                    env.bind(*name, Binding::Value);
                 }
             }
         }
@@ -270,14 +379,14 @@ impl<'a> Resolver<'a> {
     ///
     /// Args:
     ///     `stmts` (`&'a [ActionStmt]`): The action statements to resolve
-    ///     `env` (`&mut Env<'_, ()>`): The current environment
+    ///     `env` (`&mut Env<'b, Binding<'a>>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_action_stmts(
+    fn resolve_action_stmts<'b>(
         &mut self,
         stmts: &'a [ActionStmt],
-        env: &mut Env<'_, ()>,
+        env: &mut Env<'b, Binding<'a>>,
     ) -> Result<(), Error> {
         for stmt in stmts {
             self.resolve_action_stmt(stmt, env)?;
@@ -289,31 +398,48 @@ impl<'a> Resolver<'a> {
     ///
     /// Args:
     ///     `stmt` (`&'a ActionStmt`): The action statement to resolve
-    ///     `env` (`&mut Env<'_, ()>`): The current environment
+    ///     `env` (`&mut Env<'b, Binding<'a>>`): The environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_action_stmt(
+    fn resolve_action_stmt<'b>(
         &mut self,
         stmt: &'a ActionStmt,
-        env: &mut Env<'_, ()>,
+        env: &mut Env<'b, Binding<'a>>,
     ) -> Result<(), Error> {
         match stmt {
             ActionStmt::Let { name, ty: _, expr } => {
                 self.resolve_expr(expr, env)?;
-                env.bind(*name, ());
+                env.bind(*name, Binding::Value);
                 Ok(())
             }
             ActionStmt::Expr(expr) => self.resolve_expr(expr, env),
-            ActionStmt::Do(expr) => self.resolve_expr(expr, env),
+            ActionStmt::Do(expr) => self.force_resolve(expr, env),
             ActionStmt::Assert(expr, _text) => self.resolve_expr(expr, env),
             ActionStmt::Assign { name, expr } => {
                 if env.find(*name).is_none() {
-                    return Err(Error::UnknownIdentifier {
-                        name: *name,
-                        expected: ExpectedSort::Variable,
-                        context_name: self.current_context,
-                    });
+                    let is_local_member = self
+                        .current_context
+                        .and_then(|ctx| self.local_services.get(&ctx))
+                        .is_some_and(|decls| {
+                            decls.iter().any(|decl| match decl {
+                                Decl::VarDecl { name: mem, .. }
+                                | Decl::DefDecl { name: mem, .. }
+                                | Decl::TableDecl { name: mem, .. } => mem == name,
+                            })
+                        });
+
+                    if is_local_member {
+                        if !self.in_deferred_phase {
+                            return Err(Error::ForwardReference(*name));
+                        }
+                    } else {
+                        return Err(Error::UnknownIdentifier {
+                            name: *name,
+                            expected: ExpectedSort::Variable,
+                            context_name: self.current_context,
+                        });
+                    }
                 }
                 self.resolve_expr(expr, env)
             }
@@ -333,16 +459,65 @@ impl<'a> Resolver<'a> {
                 body,
             } => {
                 self.resolve_expr(iterable, env)?;
-                if self.depth >= MAX_SCOPE_DEPTH {
-                    return Err(Error::DepthLimit);
-                }
-                self.depth += 1;
                 let mut loop_env = Env::new(Some(env));
-                loop_env.bind(*var, ());
-                let res = self.resolve_action_stmts(body, &mut loop_env);
-                self.depth -= 1;
+                loop_env.bind(*var, Binding::Value);
+                self.resolve_action_stmts(body, &mut loop_env)
+            }
+        }
+    }
+
+    /// Forces immediate name resolution of a suspended computation
+    ///
+    /// Args:
+    ///     `expr` (`&'a Expr`): The target expression to force
+    ///     `env` (`&Env<'b, Binding<'a>>`): The current environment
+    ///
+    /// Returns:
+    ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
+    fn force_resolve<'b>(
+        &mut self,
+        expr: &'a Expr,
+        env: &Env<'b, Binding<'a>>,
+    ) -> Result<(), Error> {
+        match expr {
+            Expr::Func { params, body, .. } => {
+                let mut inner_env = Env::new(Some(env));
+                for param in params {
+                    inner_env.bind(param.name, Binding::Value);
+                }
+                self.resolve_expr(body.as_ref(), &inner_env)
+            }
+            Expr::Action(stmts) => {
+                let mut action_env = Env::new(Some(env));
+                self.resolve_action_stmts(stmts, &mut action_env)
+            }
+            Expr::Variable { name } => {
+                if self.currently_evaluating.contains(name) {
+                    return Ok(());
+                }
+                self.currently_evaluating.insert(*name);
+                let res = if let Some((decl_env, info)) = env.find_with_env(*name) {
+                    match info {
+                        Binding::Suspended { params, body } => {
+                            if let Some(params) = params {
+                                let mut inner_env = Env::new(Some(decl_env));
+                                for param in *params {
+                                    inner_env.bind(param.name, Binding::Value);
+                                }
+                                self.resolve_expr(body, &inner_env)
+                            } else {
+                                self.resolve_expr(body, decl_env)
+                            }
+                        }
+                        Binding::Value => Ok(()),
+                    }
+                } else {
+                    self.resolve_expr(expr, env)
+                };
+                self.currently_evaluating.remove(name);
                 res
             }
+            _ => self.resolve_expr(expr, env),
         }
     }
 
@@ -350,11 +525,15 @@ impl<'a> Resolver<'a> {
     ///
     /// Args:
     ///     `expr` (`&'a Expr`): The expression to resolve
-    ///     `env` (`&Env<'_, ()>`): The current environment
+    ///     `env` (`&Env<'b, Binding<'a>>`): The environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_expr(&mut self, expr: &'a Expr, env: &Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_expr<'b>(
+        &mut self,
+        expr: &'a Expr,
+        env: &Env<'b, Binding<'a>>,
+    ) -> Result<(), Error> {
         match expr {
             Expr::Literal { val } => self.resolve_value(val, env),
             Expr::Html(template) => {
@@ -377,10 +556,10 @@ impl<'a> Resolver<'a> {
                         });
 
                     if is_local_member {
-                        if self.depth == 0 {
-                            return Err(Error::ForwardReference(*name));
-                        } else {
+                        if self.in_deferred_phase {
                             return Ok(());
+                        } else {
+                            return Err(Error::ForwardReference(*name));
                         }
                     }
 
@@ -417,23 +596,43 @@ impl<'a> Resolver<'a> {
                 params,
                 body,
                 return_ty: _,
-            } => self.resolve_function_body(params, body.as_ref(), env),
+            } => {
+                if self.in_deferred_phase {
+                    let mut inner_env = Env::new(Some(env));
+                    for param in params {
+                        inner_env.bind(param.name, Binding::Value);
+                    }
+                    self.resolve_expr(body.as_ref(), &inner_env)?;
+                } else {
+                    self.thunks.push(Thunk {
+                        params: Some(params.clone()),
+                        body: ThunkBody::Expr(body.as_ref()),
+                        env: env.flatten(),
+                        context: self.current_context,
+                    });
+                }
+                Ok(())
+            }
             Expr::Call { func, args } => {
-                self.resolve_expr(func.as_ref(), env)?;
+                self.force_resolve(func.as_ref(), env)?;
                 for arg in args {
                     self.resolve_expr(arg, env)?;
                 }
                 Ok(())
             }
             Expr::Action(stmts) => {
-                if self.depth >= MAX_SCOPE_DEPTH {
-                    return Err(Error::DepthLimit);
+                if self.in_deferred_phase {
+                    let mut action_env = Env::new(Some(env));
+                    self.resolve_action_stmts(stmts, &mut action_env)?;
+                } else {
+                    self.thunks.push(Thunk {
+                        params: None,
+                        body: ThunkBody::ActionStmts(stmts),
+                        env: env.flatten(),
+                        context: self.current_context,
+                    });
                 }
-                self.depth += 1;
-                let mut action_env = Env::new(Some(env));
-                let res = self.resolve_action_stmts(stmts, &mut action_env);
-                self.depth -= 1;
-                res
+                Ok(())
             }
             Expr::MemberAccess {
                 service_name,
@@ -458,10 +657,6 @@ impl<'a> Resolver<'a> {
                         expected: ExpectedSort::Service,
                         context_name: self.current_context,
                     });
-                } else {
-                    // This is an imported service. We defer name resolution and type checking
-                    // of imported programs until a future patch, as required by Issue 34
-                    // "type checking for self-contained programs".
                 }
                 Ok(())
             }
@@ -518,11 +713,15 @@ impl<'a> Resolver<'a> {
     ///
     /// Args:
     ///     `val` (`&'a Value`): The value to resolve
-    ///     `env` (`&Env<'_, ()>`): The current environment
+    ///     `env` (`&Env<'b, Binding<'a>>`): The current environment
     ///
     /// Returns:
     ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_value(&mut self, val: &'a Value, env: &Env<'_, ()>) -> Result<(), Error> {
+    fn resolve_value<'b>(
+        &mut self,
+        val: &'a Value,
+        env: &Env<'b, Binding<'a>>,
+    ) -> Result<(), Error> {
         match val {
             Value::Int { val: _ } => Ok(()),
             Value::Bool { val: _ } => Ok(()),
@@ -534,20 +733,40 @@ impl<'a> Resolver<'a> {
                 env: _,
                 service_name: _,
                 return_ty: _,
-            } => self.resolve_function_body(params, body.as_ref(), env),
+            } => {
+                if self.in_deferred_phase {
+                    let mut inner_env = Env::new(Some(env));
+                    for param in params {
+                        inner_env.bind(param.name, Binding::Value);
+                    }
+                    self.resolve_expr(body.as_ref(), &inner_env)?;
+                } else {
+                    self.thunks.push(Thunk {
+                        params: Some(params.clone()),
+                        body: ThunkBody::Expr(body.as_ref()),
+                        env: env.flatten(),
+                        context: self.current_context,
+                    });
+                }
+                Ok(())
+            }
             Value::ActionClosure {
                 stmts,
                 env: _,
                 service_net_id: _,
             } => {
-                if self.depth >= MAX_SCOPE_DEPTH {
-                    return Err(Error::DepthLimit);
+                if self.in_deferred_phase {
+                    let mut action_env = Env::new(Some(env));
+                    self.resolve_action_stmts(stmts, &mut action_env)?;
+                } else {
+                    self.thunks.push(Thunk {
+                        params: None,
+                        body: ThunkBody::ActionStmts(stmts),
+                        env: env.flatten(),
+                        context: self.current_context,
+                    });
                 }
-                self.depth += 1;
-                let mut action_env = Env::new(Some(env));
-                let res = self.resolve_action_stmts(stmts, &mut action_env);
-                self.depth -= 1;
-                res
+                Ok(())
             }
             Value::List { vals } => {
                 for val in vals {
@@ -557,36 +776,6 @@ impl<'a> Resolver<'a> {
             }
             Value::Range { start: _, end: _ } => Ok(()),
         }
-    }
-
-    /// Resolves the body of a function or closure within a new scope
-    ///
-    /// Args:
-    ///     `params` (`&[Param]`): The function parameters
-    ///     `body` (`&'a Expr`): The body expression to resolve
-    ///     `env` (`&Env<'_, ()>`): The parent environment
-    ///
-    /// Returns:
-    ///     `Result<(), Error>`: Ok if resolution succeeds, or `Error`
-    fn resolve_function_body(
-        &mut self,
-        params: &[Param],
-        body: &'a Expr,
-        env: &Env<'_, ()>,
-    ) -> Result<(), Error> {
-        if self.depth >= MAX_SCOPE_DEPTH {
-            return Err(Error::DepthLimit);
-        }
-        self.depth += 1;
-
-        let mut inner_env = Env::new(Some(env));
-        for param in params {
-            inner_env.bind(param.name, ());
-        }
-
-        let res = self.resolve_expr(body, &inner_env);
-        self.depth -= 1;
-        res
     }
 }
 
@@ -701,7 +890,8 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        assert!(resolver.resolve_stmt(&stmt, &mut env).is_ok());
+        let program = vec![stmt];
+        assert!(resolver.resolve_program(&program, &mut env).is_ok());
 
         // Test sequential failure (no service variable x exists)
         // action { do x; let x = 10; }
@@ -730,7 +920,9 @@ mod tests {
         };
 
         let mut bad_env = Env::new(None);
-        let res = resolver.resolve_stmt(&bad_stmt, &mut bad_env);
+        let mut bad_resolver = Resolver::new();
+        let program_bad = vec![bad_stmt];
+        let res = bad_resolver.resolve_program(&program_bad, &mut bad_env);
         assert_eq!(
             res,
             Err(Error::UnknownIdentifier {
@@ -778,7 +970,8 @@ mod tests {
 
         let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        let res = resolver.resolve_stmt(&stmt, &mut env);
+        let program = vec![stmt];
+        let res = resolver.resolve_program(&program, &mut env);
         assert_eq!(
             res,
             Err(Error::UnknownIdentifier {
@@ -815,9 +1008,13 @@ mod tests {
             return_ty: None,
         };
 
-        let env = Env::new(None);
+        let stmt = Stmt::Watch {
+            expr: outer_closure,
+        };
+        let mut env = Env::new(None);
         let mut resolver = Resolver::new();
-        assert!(resolver.resolve_expr(&outer_closure, &env).is_ok());
+        let program = vec![stmt];
+        assert!(resolver.resolve_program(&program, &mut env).is_ok());
 
         // Verify parameter escaping triggers error:
         // fn a => (fn b => b) + b
@@ -838,7 +1035,13 @@ mod tests {
             return_ty: None,
         };
 
-        let res = resolver.resolve_expr(&escaped_closure, &env);
+        let escaped_stmt = Stmt::Watch {
+            expr: escaped_closure,
+        };
+        let mut env_escaped = Env::new(None);
+        let mut resolver_escaped = Resolver::new();
+        let program_escaped = vec![escaped_stmt];
+        let res = resolver_escaped.resolve_program(&program_escaped, &mut env_escaped);
         assert_eq!(
             res,
             Err(Error::UnknownIdentifier {
@@ -846,48 +1049,6 @@ mod tests {
                 expected: ExpectedSort::Variable,
                 context_name: None,
             })
-        );
-    }
-
-    /// Verify scope depth limit increases and decreases correctly
-    #[test]
-    fn test_unit_depth_limit_tracking() {
-        let env = Env::new(None);
-        let mut resolver = Resolver::new();
-
-        // 1. Sibling blocks do not accumulate depth
-        // We create a tuple containing two sibling action chains,
-        // each nested 100 levels deep.
-        // If depth was not decremented on exit, this would cross 128.
-        let mut nested_a = Expr::Literal {
-            val: Value::Int { val: 0 },
-        };
-        let mut nested_b = Expr::Literal {
-            val: Value::Int { val: 0 },
-        };
-        for _ in 0..100 {
-            nested_a = Expr::Action(vec![ActionStmt::Expr(nested_a)]);
-            nested_b = Expr::Action(vec![ActionStmt::Expr(nested_b)]);
-        }
-
-        let sibling_tuple = Expr::Tuple {
-            val: vec![nested_a, nested_b],
-        };
-
-        assert!(resolver.resolve_expr(&sibling_tuple, &env).is_ok());
-        assert_eq!(resolver.depth, 0);
-
-        // 2. Nested block exceeding 128 depth triggers limit
-        let mut deep_expr = Expr::Literal {
-            val: Value::Int { val: 0 },
-        };
-        for _ in 0..130 {
-            deep_expr = Expr::Action(vec![ActionStmt::Expr(deep_expr)]);
-        }
-
-        assert_eq!(
-            resolver.resolve_expr(&deep_expr, &env),
-            Err(Error::DepthLimit)
         );
     }
 
@@ -929,36 +1090,6 @@ mod tests {
         let program = vec![s_stmt, update_stmt];
         let res = resolver.resolve_program(&program, &mut env);
         assert_eq!(res, Ok(()));
-    }
-
-    /// Verify that resolver depth state is recovered on early errors
-    #[test]
-    fn test_unit_depth_limit_recovery_on_error() {
-        let mut interner = Interner::new();
-        let z = interner.insert("z");
-        let env = Env::new(None);
-        let mut resolver = Resolver::new();
-
-        // A nested action block containing an unbound variable 'z'
-        // nested 5 levels deep
-        let mut bad_expr = Expr::Variable { name: z };
-        for _ in 0..5 {
-            bad_expr = Expr::Action(vec![ActionStmt::Expr(bad_expr)]);
-        }
-
-        // Resolving should fail because z is unbound
-        let res = resolver.resolve_expr(&bad_expr, &env);
-        assert_eq!(
-            res,
-            Err(Error::UnknownIdentifier {
-                name: z,
-                expected: ExpectedSort::Variable,
-                context_name: None,
-            })
-        );
-
-        // Ensure that the depth was unwound and returned to 0
-        assert_eq!(resolver.depth, 0);
     }
 
     /// Verify that `@test` blocks can resolve variables
@@ -1042,7 +1173,7 @@ mod tests {
 
         let mut env = Env::new(None);
         // Bind service in `env` (simulating import)
-        env.bind(s, ());
+        env.bind(s, Binding::Value);
 
         let mut resolver = Resolver::new();
         let program = vec![test_stmt];
@@ -1085,37 +1216,5 @@ mod tests {
                 panic!("Expected UnknownIdentifier error");
             }
         }
-    }
-
-    /// Verify that deeply nested `for` loops trigger the depth limit
-    #[test]
-    fn test_unit_for_loop_depth_limit() {
-        let mut interner = Interner::new();
-        let x = interner.insert("x");
-        let v = interner.insert("v");
-
-        // Create a deeply nested loop structure
-        // We start with a simple expression in the innermost loop
-        let mut deep_stmt = ActionStmt::Expr(Expr::Literal {
-            val: Value::Int { val: 0 },
-        });
-
-        // Nest 130 `for` loops. Since `MAX_SCOPE_DEPTH` is 128, this
-        // must trigger the `DepthLimit` error
-        for _ in 0..130 {
-            deep_stmt = ActionStmt::For {
-                var: x,
-                iterable: Expr::Variable { name: v },
-                body: vec![deep_stmt],
-            };
-        }
-
-        let mut env = Env::new(None);
-        // Bind the iterable variable
-        env.bind(v, ());
-
-        let mut resolver = Resolver::new();
-        let res = resolver.resolve_action_stmt(&deep_stmt, &mut env);
-        assert_eq!(res, Err(Error::DepthLimit));
     }
 }

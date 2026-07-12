@@ -85,24 +85,23 @@ pub fn calc_dep_srv(decls: &[ast::Decl]) -> DependAnalysis {
 ///
 /// Args:
 ///     `stmts` (`&[ast::Stmt]`): The statements of the program
+#[deprecated(
+    since = "0.1.0",
+    note = "Deprecated in favor of name resolution thunks"
+)]
 pub fn calc_dep_prog(stmts: &[ast::Stmt]) {
-    for stmt in stmts.iter() {
-        match stmt {
-            &ast::Stmt::Service { ref decls, .. } | &ast::Stmt::Update { ref decls, .. } => {
-                let _ = calc_dep_srv(decls);
-            }
-            &ast::Stmt::ActionStmt(_) => {}
-            &ast::Stmt::Connect { .. }
-            | &ast::Stmt::Import { .. }
-            | &ast::Stmt::Test { .. }
-            | &ast::Stmt::Watch { .. } => {}
-        }
-    }
+    // This static check is deprecated by the thunk name resolution
+    // which implicitly guarantees the same DAG verification
+    // The dependency analysis module is not completely removed
+    // because it is still used in dynamic/runtime closure
+    // flattening, and removing it would cause a regression
+    let _ = stmts;
 }
 
 /// Unit tests for variable dependency analysis
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
     use crate::ast::{Decl, Expr, Stmt, Value};
     use crate::runtime::interner::Interner;

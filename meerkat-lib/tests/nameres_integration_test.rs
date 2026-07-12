@@ -4,7 +4,7 @@
 //! name resolution pass using strings parsed into AST statements
 
 use meerkat_lib::runtime::{
-    ast::{ActionStmt, Decl, Expr, Stmt, Value},
+    ast::{Decl, Expr, Stmt, Value},
     nameres::{resolve, Error, ExpectedSort},
     parser::parse_string,
     tt::Param,
@@ -95,20 +95,6 @@ fn test_integration_nested_shadowing_let() {
     let stmts = parse_result.unwrap();
     let res = resolve(&stmts);
     assert!(res.is_ok());
-}
-
-/// Verify that exceeding the maximum scope depth triggers depth limit
-#[test]
-fn test_integration_depth_limit() {
-    let mut expr = Expr::Literal {
-        val: Value::Int { val: 0 },
-    };
-    for _ in 0..130 {
-        expr = Expr::Action(vec![ActionStmt::Expr(expr)]);
-    }
-    let stmts = vec![Stmt::Watch { expr }];
-    let res = resolve(&stmts);
-    assert_eq!(res, Err(Error::DepthLimit));
 }
 
 /// Verify that function parameters resolve inside the function body

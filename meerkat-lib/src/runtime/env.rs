@@ -86,6 +86,40 @@ impl<'a, T> Env<'a, T> {
     }
 }
 
+impl<'parent, T: Clone> Env<'parent, T> {
+    /// Flatten the hierarchical environment into a single flat scope
+    ///
+    /// This preserves lexical shadowing by ensuring that child bindings
+    /// overwrite parent bindings of the same name
+    ///
+    /// Returns:
+    ///     `Env<'out, T>`: A new flat environment with no parent
+    pub fn flatten<'out>(&self) -> Env<'out, T> {
+        let mut bindings = HashMap::new();
+        self.flatten_into(&mut bindings);
+        Env {
+            bindings,
+            parent: None,
+        }
+    }
+
+    /// Recursively insert parent bindings into the output map
+    ///
+    /// Traverses the chain from parents to children so that child
+    /// bindings override parents to respect lexical shadowing
+    ///
+    /// Args:
+    ///     `out` (`&mut HashMap<Symbol, T>`): The output map
+    fn flatten_into(&self, out: &mut HashMap<Symbol, T>) {
+        if let Some(parent) = self.parent {
+            parent.flatten_into(out);
+        }
+        for (k, v) in &self.bindings {
+            out.insert(*k, v.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +203,20 @@ mod tests {
         }
 
         assert_eq!(helper(&parent, s), Some(42));
+    }
+
+    #[test]
+    /// Verify that `Env::flatten` correctly collapses environment scopes
+    /// and preserves lexical shadowing
+    fn test_unit_env_flatten_shadowing() {
+        let mut parent = Env::new(None);
+        let s = Symbol::empty();
+        parent.bind(s, 1);
+
+        let mut child = Env::new(Some(&parent));
+        child.bind(s, 2);
+
+        let flat = child.flatten();
+        assert_eq!(flat.find(s), Some(&2));
     }
 }
