@@ -37,6 +37,12 @@ struct Args {
     #[arg(short = 'p', long = "port", default_value_t = 9000)]
     port: u16,
 
+    /// #39: WebSocket port for browser (wasm) clients in server mode.
+    /// Browsers cannot dial a raw TCP multiaddr, so the server listens on a
+    /// second, WebSocket address. Defaults to `port + 1`.
+    #[arg(long = "ws-port")]
+    ws_port: Option<u16>,
+
     /// Bind to loopback/localhost only (force 127.0.0.1 instead of public IP)
     #[arg(long = "local", default_value_t = false)]
     local: bool,
@@ -106,7 +112,16 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             if args.server {
-                run_server(prog, file, remote_url_map, args.port, args.local, interner).await
+                run_server(
+                    prog,
+                    file,
+                    remote_url_map,
+                    args.port,
+                    args.ws_port,
+                    args.local,
+                    interner,
+                )
+                .await
             } else {
                 run_client(prog, file, remote_url_map, args.local, args.watch, interner).await
             }
@@ -257,6 +272,7 @@ async fn run_server(
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
     port: u16,
+    ws_port: Option<u16>,
     local: bool,
     interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
@@ -287,6 +303,29 @@ async fn run_server(
         .replace("127.0.0.1", &node_ip);
     let full_addr = format!("{}/p2p/{}", actual_addr_str, peer_id);
     println!("Server listening at: {}", full_addr);
+
+    // #39: browser (wasm) clients can only speak WebSocket, so listen on a
+    // second address for them. The TCP address above stays canonical: native
+    // peers dial it, and it is what service URLs and reply addresses use.
+    let ws_port = match ws_port {
+        Some(p) => p,
+        None => port
+            .checked_add(1)
+            .ok_or("port 65535 has no room for a default WebSocket port; pass --ws-port")?,
+    };
+    let ws_listen_addr = Address::new(format!("/ip4/{}/tcp/{}/ws", listen_ip, ws_port));
+    let ws_reply = net
+        .handle_command(NetworkCommand::Listen {
+            addr: ws_listen_addr,
+        })
+        .await;
+    let actual_ws_addr = listen_success_addr(ws_reply)?;
+    let actual_ws_addr_str = actual_ws_addr
+        .0
+        .replace("0.0.0.0", &node_ip)
+        .replace("127.0.0.1", &node_ip);
+    let ws_full_addr = format!("{}/p2p/{}", actual_ws_addr_str, peer_id);
+    println!("Browser clients connect at: {}", ws_full_addr);
 
     // Print service URLs
     for stmt in &prog {
