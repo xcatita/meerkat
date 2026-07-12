@@ -182,9 +182,10 @@ fn test_integration_watch_unbound() {
     );
 }
 
-/// Verify that update statements resolve with UpdateResolutionUnimplemented error
+/// Verify that update statements are ignored with a warning
+/// during name resolution
 #[test]
-fn test_integration_update_stmt() {
+fn test_integration_update_stmt_ignored() {
     let mut interner = Interner::new();
     let s1 = interner.insert("s1");
     let y = interner.insert("y");
@@ -207,12 +208,13 @@ fn test_integration_update_stmt() {
 
     let stmts = vec![s1_stmt, update_stmt];
     let res = resolve(&stmts);
-    assert_eq!(res, Err(Error::UpdateResolutionUnimplemented));
+    assert!(res.is_ok());
 }
 
-/// Verify that update on unbound service name triggers UpdateResolutionUnimplemented
+/// Verify that update on unbound service name is ignored
+/// with a warning
 #[test]
-fn test_integration_update_unbound() {
+fn test_integration_update_unbound_ignored() {
     let mut interner = Interner::new();
     let s2 = interner.insert("s2");
     let y = interner.insert("y");
@@ -231,7 +233,7 @@ fn test_integration_update_unbound() {
 
     let stmts = vec![update_stmt];
     let res = resolve(&stmts);
-    assert_eq!(res, Err(Error::UpdateResolutionUnimplemented));
+    assert!(res.is_ok());
 }
 
 /// Verify that select expressions validate their table name
@@ -703,9 +705,9 @@ fn test_integration_nested_blocks_let_isolation() {
     );
 }
 
-/// Verify service update block returns UpdateResolutionUnimplemented
+/// Verify service update block is ignored
 #[test]
-fn test_integration_update_stmt_rejects_forward_reference() {
+fn test_integration_update_stmt_ignored_forward_reference() {
     let mut interner = Interner::new();
     let s1 = interner.insert("s1");
     let x = interner.insert("x");
@@ -736,10 +738,10 @@ fn test_integration_update_stmt_rejects_forward_reference() {
 
     let stmts = vec![s1_stmt, update_stmt];
     let res = resolve(&stmts);
-    assert_eq!(res, Err(Error::UpdateResolutionUnimplemented));
+    assert!(res.is_ok());
 }
 
-/// Verify service update block returns UpdateResolutionUnimplemented
+/// Verify service update block variables are not visible
 #[test]
 fn test_integration_update_stmt_scoping() {
     let mut interner = Interner::new();
@@ -766,7 +768,14 @@ fn test_integration_update_stmt_scoping() {
 
     let stmts = vec![s1_stmt, update_stmt, watch_stmt];
     let res = resolve(&stmts);
-    assert_eq!(res, Err(Error::UpdateResolutionUnimplemented));
+    assert_eq!(
+        res,
+        Err(Error::UnknownIdentifier {
+            name: y,
+            expected: ExpectedSort::Variable,
+            context_name: None,
+        })
+    );
 }
 
 /// Verify that `@test` blocks can resolve variables
@@ -817,8 +826,9 @@ fn test_integration_test_block_hoisting() {
 /// `ImportResolutionUnimplemented` error
 /// TODO: Remove this test when name resolution and type
 /// checking are implemented for imports
+/// Verify testing an imported service is ignored with a warning
 #[test]
-fn test_integration_test_block_imported_unsupported() {
+fn test_integration_test_block_imported_ignored() {
     let mut interner = Interner::new();
     let input = "
         import s1
@@ -830,16 +840,7 @@ fn test_integration_test_block_imported_unsupported() {
     assert!(parse_result.is_ok());
     let stmts = parse_result.unwrap();
     let res = resolve(&stmts);
-    assert!(res.is_err());
-    match res.unwrap_err() {
-        Error::ImportResolutionUnimplemented => {}
-        Error::UnknownIdentifier { .. }
-        | Error::DepthLimit
-        | Error::UpdateResolutionUnimplemented
-        | Error::ForwardReference(..) => {
-            panic!("Expected ImportResolutionUnimplemented error");
-        }
-    }
+    assert!(res.is_ok());
 }
 
 /// Verify complex out-of-order mutually referential service

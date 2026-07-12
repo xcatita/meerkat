@@ -43,10 +43,6 @@ pub enum Error {
     },
     /// The AST nesting depth exceeded the limit
     DepthLimit,
-    /// Testing an imported service is not yet supported
-    ImportResolutionUnimplemented,
-    /// Updating a service is not yet supported in name resolution
-    UpdateResolutionUnimplemented,
     /// A value was referenced eagerly before being declared
     ForwardReference(Symbol),
 }
@@ -71,20 +67,6 @@ impl fmt::Display for Error {
             }
             Error::DepthLimit => {
                 write!(f, "Depth limit exceeded")
-            }
-            Error::ImportResolutionUnimplemented => {
-                write!(
-                    f,
-                    "Name resolution for imported services \
-                     is not yet implemented"
-                )
-            }
-            Error::UpdateResolutionUnimplemented => {
-                write!(
-                    f,
-                    "Name resolution for update statements \
-                     is not yet implemented"
-                )
             }
             Error::ForwardReference(name) => {
                 write!(
@@ -176,7 +158,14 @@ impl<'a> Resolver<'a> {
     fn resolve_stmt(&mut self, stmt: &'a Stmt, env: &mut Env<'_, ()>) -> Result<(), Error> {
         match stmt {
             Stmt::ActionStmt(action) => self.resolve_action_stmt(action, env),
-            Stmt::Update { .. } => Err(Error::UpdateResolutionUnimplemented),
+            Stmt::Update { .. } => {
+                println!(
+                    "warning: nameres: ignoring 'update' \
+                     checks as not yet implemented"
+                );
+                // TODO: implement `update` resolution
+                Ok(())
+            }
             Stmt::Connect { path: _, addr: _ } => Ok(()),
             Stmt::Import {
                 path: _,
@@ -222,7 +211,13 @@ impl<'a> Resolver<'a> {
                     }
                     None => {
                         self.current_context = prev_context;
-                        return Err(Error::ImportResolutionUnimplemented);
+                        println!(
+                            "warning: nameres: ignoring 'import' \
+                             checks as not yet implemented"
+                        );
+                        // TODO: implement imported service `test`
+                        // resolution
+                        return Ok(());
                     }
                 }
                 let res = self.resolve_action_stmts(stmts, &mut test_env);
@@ -896,9 +891,9 @@ mod tests {
         );
     }
 
-    /// Verify update block returns UpdateResolutionUnimplemented
+    /// Verify update block is ignored with warning
     #[test]
-    fn test_unit_update_block_returns_unimplemented() {
+    fn test_unit_update_block_logs_warning() {
         let mut interner = Interner::new();
         let s = interner.insert("s");
         let x = interner.insert("x");
@@ -933,7 +928,7 @@ mod tests {
         let mut resolver = Resolver::new();
         let program = vec![s_stmt, update_stmt];
         let res = resolver.resolve_program(&program, &mut env);
-        assert_eq!(res, Err(Error::UpdateResolutionUnimplemented));
+        assert_eq!(res, Ok(()));
     }
 
     /// Verify that resolver depth state is recovered on early errors
@@ -1032,10 +1027,9 @@ mod tests {
         assert!(resolver.resolve_program(&program, &mut env).is_ok());
     }
 
-    /// Verify testing an imported service yields an
-    /// `ImportResolutionUnimplemented` error
+    /// Verify testing an imported service is ignored with warning
     #[test]
-    fn test_unit_test_block_imported_unsupported() {
+    fn test_unit_test_block_imported_logs_warning() {
         let mut interner = Interner::new();
         let s = interner.insert("s");
         let x = interner.insert("x");
@@ -1054,16 +1048,7 @@ mod tests {
         let program = vec![test_stmt];
 
         let result = resolver.resolve_program(&program, &mut env);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            Error::ImportResolutionUnimplemented => {}
-            Error::UnknownIdentifier { .. }
-            | Error::DepthLimit
-            | Error::UpdateResolutionUnimplemented
-            | Error::ForwardReference(..) => {
-                panic!("Expected ImportResolutionUnimplemented error");
-            }
-        }
+        assert!(result.is_ok());
     }
 
     /// Verify testing an undefined service yields an
@@ -1096,10 +1081,7 @@ mod tests {
                 assert_eq!(expected, ExpectedSort::Service);
                 assert_eq!(context_name, None);
             }
-            Error::ImportResolutionUnimplemented
-            | Error::DepthLimit
-            | Error::UpdateResolutionUnimplemented
-            | Error::ForwardReference(..) => {
+            Error::DepthLimit | Error::ForwardReference(..) => {
                 panic!("Expected UnknownIdentifier error");
             }
         }

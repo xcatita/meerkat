@@ -64,9 +64,7 @@ impl<'a> Node<'a> {
                             name_str, expected, ctx_str
                         )
                     }
-                    None => {
-                        format!("Unknown identifier '{}' (expected {})", name_str, expected)
-                    }
+                    None => format!("Unknown identifier '{}' (expected {})", name_str, expected),
                 };
                 Error::Message(msg)
             }
@@ -79,12 +77,7 @@ impl<'a> Node<'a> {
                 );
                 Error::Message(msg)
             }
-            nameres::Error::UpdateResolutionUnimplemented => Error::Message(
-                "Name resolution for update statements \
-                     is not yet implemented"
-                    .to_string(),
-            ),
-            other => Error::Message(other.to_string()),
+            nameres::Error::DepthLimit => Error::Message(e.to_string()),
         })
     }
 
