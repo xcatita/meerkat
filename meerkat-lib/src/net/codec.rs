@@ -5,7 +5,8 @@
 
 use crate::error::{Error, Result};
 use crate::net::ast::{
-    NetActionStmt, NetBinOp, NetExpr, NetField, NetParam, NetTableType, NetType, NetUnOp, NetValue,
+    NetActionStmt, NetBinOp, NetExpr, NetField, NetParam, NetServiceType, NetTableType, NetType,
+    NetUnOp, NetValue,
 };
 use crate::net::types::MeerkatMessage;
 use crate::runtime::ast::{ActionStmt, BinOp, Expr, Field, TableType, UnOp, Value};
@@ -13,7 +14,7 @@ use crate::runtime::interner::{Interner, Symbol};
 use crate::runtime::limits::{
     MAX_IDENTIFIER_LENGTH, MAX_NET_REQUEST_STRING_LENGTH, MAX_STRING_LITERAL_LENGTH, MAX_TYPE_DEPTH,
 };
-use crate::runtime::tt::{Param, TupleType, Type};
+use crate::runtime::tt::{Param, ServiceType, TupleType, Type};
 
 fn validate_identifier(s: &str) -> Result<()> {
     if s.len() > MAX_IDENTIFIER_LENGTH {
@@ -248,11 +249,45 @@ pub fn encode_type(ty: &Type) -> Result<NetType> {
     encode_type_internal(ty, 0)
 }
 
+/// Encode a runtime `ServiceType` into its network representation
+///
+/// Args:
+///     `st` (`&ServiceType`): The runtime service type to encode
+///     `interner` (`&Interner`): The interner for symbol lookup
+///
+/// Returns:
+///     `Result<NetServiceType>`: The encoded network service type
+///
+/// Raises:
+///     `Error::Message`: If a field is missing due to a broken invariant
+pub fn encode_servicetype<'a>(st: &ServiceType<'a>, interner: &Interner) -> Result<NetServiceType> {
+    let mut fields = Vec::new();
+    for name in st.field_order() {
+        let name_str = interner.get(*name).to_string();
+        // While `ServiceType` encapsulation theoretically guarantees
+        // that `field_order` entries exist in `fields`, we
+        // defensively return an `Error::Message` instead of
+        // panicking to ensure the network service fails
+        // gracefully if an internal bug occurs
+        let field_ty = st.fields().find(*name).ok_or_else(|| {
+            Error::Message(format!(
+                "Internal invariant broken: field_order \
+                     entry missing from fields map: {}",
+                name_str
+            ))
+        })?;
+        let net_ty = encode_type(field_ty)?;
+        fields.push((name_str, net_ty));
+    }
+    Ok(NetServiceType { fields })
+}
+
 /// Decode a network `NetType` with recursion depth accumulator
 ///
 /// Args:
 ///     ty (`NetType`): The network type to decode
 ///     depth (`usize`): The current recursion depth
+///     interner (`&mut Interner`): The interner for interning symbols
 ///
 /// Returns:
 ///     `Result<Type>`: The decoded runtime type
@@ -314,6 +349,33 @@ fn decode_type_internal(ty: NetType, depth: usize) -> Result<Type> {
 ///     maximum limit
 pub fn decode_type(ty: NetType) -> Result<Type> {
     decode_type_internal(ty, 0)
+}
+
+/// Decode a network `NetServiceType` into a runtime `ServiceType`
+///
+/// Args:
+///     nst (`NetServiceType`): The network service type to decode
+///     interner (`&mut Interner`): The interner for interning symbols
+///
+/// Returns:
+///     `Result<ServiceType>`: The decoded runtime service type
+pub fn decode_servicetype<'a>(
+    nst: NetServiceType,
+    interner: &mut Interner,
+) -> Result<ServiceType<'a>> {
+    let mut st = ServiceType::default();
+    for (name_str, net_ty) in nst.fields {
+        validate_identifier(&name_str)?;
+        let sym = interner.insert(&name_str);
+        let ty = decode_type(net_ty)?;
+        st.add_field(sym, ty).map_err(|_| {
+            Error::Message(format!(
+                "duplicate field name '{}' in ServiceType",
+                name_str
+            ))
+        })?;
+    }
+    Ok(st)
 }
 
 /// Encode a runtime `Param` into a network representation
@@ -1764,5 +1826,103 @@ mod service_code_tests {
         let res = resolve_served_file(&dir, "nope.mkt");
         assert!(res.is_err(), "missing file must be rejected");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify round-trip encoding and decoding for a ServiceType
+    #[test]
+    fn test_codec_service_type_roundtrip() {
+        let mut interner = Interner::new();
+        let field_a = interner.insert("a");
+        let field_b = interner.insert("b");
+
+        let mut original_type = ServiceType::default();
+        original_type.add_field(field_a, Type::Int).unwrap();
+        original_type.add_field(field_b, Type::String).unwrap();
+
+        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+
+        let mut interner_new = Interner::new();
+        let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
+
+        // Note: We re-encode to compare `NetServiceType` values
+        // instead of comparing the decoded runtime `ServiceType`
+        // instances directly. Runtime `ServiceType` equality
+        // depends on `Interner` `Symbol` IDs, which might
+        // misalign between the original and new `Interner`
+        // instances, causing brittle test failures. The
+        // `NetServiceType` correctly reflects network equivalence
+        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        assert_eq!(encoded, reencoded);
+    }
+
+    /// Verify round-trip encoding and decoding for an empty ServiceType (zero fields)
+    #[test]
+    fn test_codec_service_type_empty_roundtrip() {
+        let interner = Interner::new();
+        let original_type = ServiceType::default();
+
+        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+        assert!(encoded.fields.is_empty());
+
+        let mut interner_new = Interner::new();
+        let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
+
+        // Note: We re-encode to compare `NetServiceType` values
+        // instead of comparing the decoded runtime `ServiceType`
+        // instances directly. Runtime `ServiceType` equality
+        // depends on `Interner` `Symbol` IDs, which might
+        // misalign between the original and new `Interner`
+        // instances, causing brittle test failures. The
+        // `NetServiceType` correctly reflects network equivalence
+        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        assert_eq!(encoded, reencoded);
+    }
+
+    /// Verify round-trip encoding and decoding for a ServiceType with complex types (Tuple, Func)
+    #[test]
+    fn test_codec_service_type_complex_roundtrip() {
+        let mut interner = Interner::new();
+        let field_tuple = interner.insert("t");
+        let field_func = interner.insert("f");
+
+        let tuple_ty = Type::Tuple(TupleType::new(vec![Type::Int, Type::String]).unwrap());
+        let func_ty = Type::Func(Box::new(Type::Bool), Box::new(Type::Unit));
+
+        let mut original_type = ServiceType::default();
+        original_type.add_field(field_tuple, tuple_ty).unwrap();
+        original_type.add_field(field_func, func_ty).unwrap();
+
+        let encoded = encode_servicetype(&original_type, &interner).unwrap();
+
+        let mut interner_new = Interner::new();
+        let decoded = decode_servicetype(encoded.clone(), &mut interner_new).unwrap();
+
+        // Note: We re-encode to compare `NetServiceType` values
+        // instead of comparing the decoded runtime `ServiceType`
+        // instances directly. Runtime `ServiceType` equality
+        // depends on `Interner` `Symbol` IDs, which might
+        // misalign between the original and new `Interner`
+        // instances, causing brittle test failures. The
+        // `NetServiceType` correctly reflects network equivalence
+        let reencoded = encode_servicetype(&decoded, &interner_new).unwrap();
+        assert_eq!(encoded, reencoded);
+    }
+
+    /// Verify that decode_servicetype returns an error if NetServiceType has duplicate field names
+    #[test]
+    fn test_codec_service_type_duplicate_fields_error() {
+        let invalid_nst = NetServiceType {
+            fields: vec![
+                ("duplicate_field".to_string(), NetType::Int),
+                ("duplicate_field".to_string(), NetType::String),
+            ],
+        };
+
+        let mut interner = Interner::new();
+        let res = decode_servicetype(invalid_nst, &mut interner);
+        assert!(res.is_err());
+        assert!(
+            matches!(res.unwrap_err(), Error::Message(ref msg) if msg.contains("duplicate field name"))
+        );
     }
 }

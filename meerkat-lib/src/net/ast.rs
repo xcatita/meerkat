@@ -13,6 +13,12 @@ pub struct NetField {
     pub ty: NetTableType,
 }
 
+/// Network representation of a service type holding ordered fields
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct NetServiceType {
+    pub fields: Vec<(String, NetType)>,
+}
+
 /// Network representation of a type in the Meerkat language
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum NetType {

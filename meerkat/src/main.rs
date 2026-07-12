@@ -11,7 +11,7 @@ use meerkat_lib::runtime::ast::{AstPrinter, Stmt};
 use meerkat_lib::runtime::interner::{Interner, Symbol};
 use meerkat_lib::runtime::interpreter::EvalError;
 use meerkat_lib::runtime::manager::ParkedRequest;
-use meerkat_lib::runtime::{parser, Manager};
+use meerkat_lib::runtime::{parser, Manager, Node};
 use std::collections::HashSet;
 use std::error::Error;
 
@@ -83,33 +83,38 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mut interner = Interner::new();
+    let mut node = Node::new();
 
     match args.input_file {
         Some(ref file) => {
-            let prog = parser::parse_file(file, &mut interner)
+            let prog = node
+                .load_file(file)
                 .map_err(|e| format!("Parse error: {}", e))?;
 
-            // This must appear prior to `check_only` or it will never print. These
-            // modes are designed to work both in isolation and in tandem
+            // This must appear prior to `check_only` or it will never
+            // print. These modes are designed to work both in
+            // isolation and in tandem
             if args.ast {
-                let printer = AstPrinter::new(&interner);
+                let printer = AstPrinter::new(&node.interner);
                 printer.print_program(&prog);
             }
 
-            // TODO: Insert static checks here. The static checks must occur at this
-            // program point in order to properly sequence the semantics of these
-            // CLI flags. All standard checks go here; additional static checks
-            // must occur after this AND in the `check_only` branch below; both must
-            // be simultaneously maintained
+            // Perform static validation checks on the parsed program
+            // statements before executing or starting the server
+            node.check(&prog)
+                .map_err(|e| format!("Static check error: {}", e))?;
 
-            // This mode must appear before `server` args check in order to properly
-            // stop execution. Logic for static checks must not occur in this branch,
-            // as the intent of this mode is to simply halt after the static semantics
-            // phase of the interpter/compiler. See also: above comment(s)
+            // This mode must appear before `server` args check in
+            // order to properly stop execution. Logic for static
+            // checks must not occur in this branch, as the intent
+            // of this mode is to simply halt after the static
+            // semantics phase of the interpreter/compiler. See
+            // also: above comment(s)
             if args.check_only {
                 return Ok(());
             }
+
+            let interner = node.interner;
 
             if args.server {
                 run_server(
@@ -128,12 +133,11 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         }
         None => {
             if args.server || args.check_only || args.ast || args.watch {
-                return Err(
-                    "Expected a .mkt file (-f) for --server, --check, --ast, or --watch mode."
-                        .into(),
-                );
+                return Err("Expected a .mkt file (-f) for --server, --check, \
+                     --ast, or --watch mode."
+                    .into());
             }
-            let mut manager = Manager::new(interner);
+            let mut manager = node.start();
             manager.local = args.local;
             repl::run_repl(manager, remote_url_map).await
         }
