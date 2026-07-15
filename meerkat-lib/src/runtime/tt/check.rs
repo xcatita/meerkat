@@ -704,7 +704,7 @@ impl<'a, 'b> Context<'a, 'b> {
                     Ok(Type::Bool)
                 }
                 BinOp::Eq => {
-                    let ty1 = self.infer(expr1, env, 1)?;
+                    let ty1 = self.infer(expr1, env, type_depth)?;
                     self.check_expr(expr2, &ty1, env)?;
                     Ok(Type::Bool)
                 }
@@ -721,7 +721,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 return_ty,
             } => self.infer_function_type(params, body, return_ty.as_ref(), env, type_depth),
             Expr::Call { func, args } => {
-                let func_ty = self.infer(func, env, 1)?;
+                let func_ty = self.infer(func, env, type_depth)?;
                 if let Type::Func(param_ty, ret_ty) = func_ty {
                     if args.is_empty() {
                         if *param_ty != Type::Unit {
@@ -817,7 +817,6 @@ impl<'a, 'b> Context<'a, 'b> {
         let mut param_types = Vec::new();
         for param in params {
             if let Some(p_ty) = &param.ty {
-                check_type(p_ty, 1)?;
                 local_env.bind(param.name, p_ty.clone());
                 param_types.push(p_ty.clone());
             } else {
@@ -832,8 +831,9 @@ impl<'a, 'b> Context<'a, 'b> {
             let tuple_ty = TupleType::new(param_types).map_err(|_| Error::InvalidTupleArity)?;
             Type::Tuple(tuple_ty)
         };
+        check_type(&p_ty, type_depth + 1)?;
         let r_ty = if let Some(annotated_ret) = return_ty {
-            check_type(annotated_ret, 1)?;
+            check_type(annotated_ret, type_depth + 1)?;
             self.check_expr(body, annotated_ret, &mut local_env)?;
             annotated_ret.clone()
         } else {
@@ -902,6 +902,8 @@ impl<'a, 'b> Context<'a, 'b> {
                             TupleType::new(param_types).map_err(|_| Error::InvalidTupleArity)?;
                         Type::Tuple(tuple_ty)
                     };
+                    check_type(&expected_param, type_depth + 1)?;
+                    check_type(ret_ty, type_depth + 1)?;
                     Ok(Type::Func(
                         Box::new(expected_param),
                         Box::new(ret_ty.clone()),
