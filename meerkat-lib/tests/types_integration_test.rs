@@ -885,3 +885,21 @@ fn test_integration_indirect_member_reference() {
     ";
     assert!(check_program(input).is_ok())
 }
+
+/// Verify that a well-typed watch statement passes checks
+#[test]
+fn test_integration_watch_well_typed() {
+    let input = "
+        watch 1 + 2;
+    ";
+    assert!(check_program(input).is_ok())
+}
+
+/// Verify that an ill-typed watch statement is rejected
+#[test]
+fn test_integration_watch_ill_typed() {
+    let input = "
+        watch 1 + \"hello\";
+    ";
+    assert!(check_program(input).is_err())
+}

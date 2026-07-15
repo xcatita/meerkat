@@ -199,7 +199,27 @@ impl<'a, 'b> Context<'a, 'b> {
                     let mut local_env = Env::new(None);
                     self.check_action_stmt(action, &mut local_env)?;
                 }
-                _ => {}
+                Stmt::Watch { expr } => {
+                    let mut local_env = Env::new(None);
+                    self.infer(expr, &mut local_env, 1)?;
+                }
+                Stmt::Update { .. } => {
+                    // TODO(Issue #156): Implement static checks
+                    // (deferred per Issue #34)
+                    println!(
+                        "warning: tt/check: ignoring 'update' \
+                         checks as not yet implemented"
+                    );
+                }
+                Stmt::Import { .. } => {
+                    // TODO(Issue #156): Implement static checks
+                    // (deferred per Issue #34)
+                    println!(
+                        "warning: tt/check: ignoring 'import' \
+                         checks as not yet implemented"
+                    );
+                }
+                Stmt::Connect { .. } | Stmt::Service { .. } => {}
             }
         }
 
@@ -217,6 +237,8 @@ impl<'a, 'b> Context<'a, 'b> {
     /// Raises:
     ///     Error::UnboundVariable: If service is not found
     fn find_service_decls(&self, service_name: Symbol) -> Result<&'a [Decl], Error> {
+        // TODO(Issue #156): Support looking up declarations
+        // from Stmt::Update (deferred per Issue #34)
         for stmt in self.program {
             if let Stmt::Service { name, decls } = stmt {
                 if *name == service_name {
@@ -321,7 +343,14 @@ impl<'a, 'b> Context<'a, 'b> {
                 Decl::VarDecl { name, .. } | Decl::DefDecl { name, .. } => {
                     self.type_of_member(service_name, *name)?;
                 }
-                Decl::TableDecl { .. } => {}
+                Decl::TableDecl { .. } => {
+                    // TODO(Issue #156): Implement Table type schema
+                    // validation (deferred per Issue #34)
+                    println!(
+                        "warning: tt/check: ignoring 'table' \
+                         schema checks as not yet implemented"
+                    );
+                }
             }
         }
         Ok(())
@@ -411,6 +440,12 @@ impl<'a, 'b> Context<'a, 'b> {
                 Ok(())
             }
             ActionStmt::Insert { row, .. } => {
+                // TODO(Issue #156): Validate inserted row against
+                // table schema (deferred per Issue #34)
+                println!(
+                    "warning: tt/check: ignoring 'insert' \
+                     checks as not yet implemented"
+                );
                 self.infer(row, env, 1)?;
                 Ok(())
             }
@@ -602,7 +637,19 @@ impl<'a, 'b> Context<'a, 'b> {
                     return_ty,
                     ..
                 } => self.infer_function_type(params, body, return_ty.as_ref(), env, type_depth),
-                _ => self.infer_value(val, type_depth),
+                Value::ActionClosure { stmts, .. } => {
+                    let mut action_env = Env::new(Some(env));
+                    for stmt in stmts {
+                        self.check_action_stmt(stmt, &mut action_env)?;
+                    }
+                    Ok(Type::Unit)
+                }
+                Value::Int { .. }
+                | Value::Bool { .. }
+                | Value::String { .. }
+                | Value::Html(..)
+                | Value::List { .. }
+                | Value::Range { .. } => self.infer_value(val, type_depth),
             },
             Expr::Html(_) => Ok(Type::String),
             Expr::Variable { name } => {
@@ -811,7 +858,7 @@ impl<'a, 'b> Context<'a, 'b> {
             Value::Int { .. } => Ok(Type::Int),
             Value::Bool { .. } => Ok(Type::Bool),
             Value::String { .. } => Ok(Type::String),
-            Value::Html { .. } => Ok(Type::String),
+            Value::Html(..) => Ok(Type::String),
             Value::List { vals } => {
                 if vals.is_empty() {
                     Err(Error::CannotInferType)
@@ -830,7 +877,39 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
             }
             Value::Range { .. } => Ok(Type::List(Box::new(Type::Int))),
-            _ => Err(Error::CannotInferType),
+            Value::ActionClosure { .. } => Ok(Type::Unit),
+            Value::Closure {
+                params, return_ty, ..
+            } => {
+                if let Some(ret_ty) = return_ty {
+                    let mut param_types = Vec::new();
+                    for param in params {
+                        if let Some(param_ty) = &param.ty {
+                            param_types.push(param_ty.clone());
+                        } else {
+                            // If any parameter lacks type annotation,
+                            // we cannot statically infer the closure's
+                            // full type signature without an env.
+                            return Err(Error::CannotInferType);
+                        }
+                    }
+                    let expected_param = if param_types.is_empty() {
+                        Type::Unit
+                    } else if param_types.len() == 1 {
+                        param_types[0].clone()
+                    } else {
+                        let tuple_ty =
+                            TupleType::new(param_types).map_err(|_| Error::InvalidTupleArity)?;
+                        Type::Tuple(tuple_ty)
+                    };
+                    Ok(Type::Func(
+                        Box::new(expected_param),
+                        Box::new(ret_ty.clone()),
+                    ))
+                } else {
+                    Err(Error::CannotInferType)
+                }
+            }
         }
     }
 }
