@@ -66,7 +66,7 @@ fn check_type(ty: &Type, depth: usize) -> Result<(), Error> {
         return Err(Error::DepthLimitExceeded);
     }
     match ty {
-        Type::Int | Type::String | Type::Bool | Type::Unit => Ok(()),
+        Type::Int | Type::String | Type::Bool | Type::Unit | Type::UnresolvedService(_) => Ok(()),
         Type::Tuple(ts) => {
             for t in ts.iter() {
                 check_type(t, depth + 1)?;
@@ -296,7 +296,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 "warning: tt/check: skipping member type check for \
                  imported service (type unknown at compile time)"
             );
-            return Ok(Type::Unit);
+            return Ok(Type::UnresolvedService(service_name));
         }
 
         let key = (service_name, member_name);
@@ -627,7 +627,13 @@ impl<'a, 'b> Context<'a, 'b> {
             }
             (e, t) => {
                 let inferred = self.infer(e, env, 1)?;
-                if inferred == *t {
+                // Structural equality bridge: if either the inferred type or
+                // the expected type is an UnresolvedService sentinel, we bypass
+                // the check, treating it as a dynamic/any type
+                if inferred == *t
+                    || matches!(inferred, Type::UnresolvedService(_))
+                    || matches!(t, Type::UnresolvedService(_))
+                {
                     Ok(())
                 } else {
                     Err(Error::TypeMismatch {
@@ -736,14 +742,7 @@ impl<'a, 'b> Context<'a, 'b> {
                 }
                 BinOp::Eq => {
                     let ty1 = self.infer(expr1, env, type_depth)?;
-                    // If the left side resolved to `Unit`, it is the sentinel
-                    // type used for imported service members whose concrete
-                    // types are not known at compile time. Skip checking the
-                    // right side to avoid false type errors cascading from
-                    // the import bypass
-                    if ty1 != Type::Unit {
-                        self.check_expr(expr2, &ty1, env)?;
-                    }
+                    self.check_expr(expr2, &ty1, env)?;
                     Ok(Type::Bool)
                 }
             },
