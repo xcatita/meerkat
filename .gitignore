@@ -24,7 +24,10 @@ target
 !/.vscode/extensions.json
 **/.DS_Store
 
-#!src/utils/debug/ 
+#!src/utils/debug/
+
+# Meerkat server keys for use with --identity
+**/*.key
 
 # Temporary folders
 tmp/
