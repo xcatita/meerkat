@@ -152,10 +152,12 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     prog,
                     file,
                     remote_url_map,
-                    args.port,
-                    args.ws_port,
-                    args.local,
-                    args.identity,
+                    ServerConfig {
+                        port: args.port,
+                        ws_port: args.ws_port,
+                        local: args.local,
+                        identity: args.identity,
+                    },
                     interner,
                 )
                 .await
@@ -303,14 +305,20 @@ fn listen_success_addr(reply: NetworkReply) -> Result<Address, Box<dyn Error>> {
     }
 }
 
-async fn run_server(
-    prog: Vec<Stmt>,
-    input_file: &str,
-    remote_url_map: std::collections::HashMap<String, String>,
+/// #151: server runtime configuration, grouped so related settings share a
+/// single home and `run_server` keeps a small, readable signature.
+struct ServerConfig {
     port: u16,
     ws_port: Option<u16>,
     local: bool,
     identity: Option<std::path::PathBuf>,
+}
+
+async fn run_server(
+    prog: Vec<Stmt>,
+    input_file: &str,
+    remote_url_map: std::collections::HashMap<String, String>,
+    config: ServerConfig,
     interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
     // #39: the directory the server was started from is the root for serving
@@ -322,17 +330,17 @@ async fn run_server(
         .to_path_buf();
     // #151: when an identity file is configured, load (or create) a
     // persistent keypair so the Peer ID is stable across restarts.
-    let identity_keypair = match identity {
+    let identity_keypair = match config.identity {
         Some(path) => Some(load_or_create_identity(&path)?),
         None => None,
     };
     let mut net = NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
     let mut manager = Manager::new(interner);
-    manager.local = local;
+    manager.local = config.local;
 
     let node_ip = manager.get_node_ip();
-    let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
-    let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, port));
+    let listen_ip = if config.local { "127.0.0.1" } else { "0.0.0.0" };
+    let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, config.port));
     let reply = net
         .handle_command(NetworkCommand::Listen { addr: listen_addr })
         .await;
@@ -350,9 +358,10 @@ async fn run_server(
     // #39: browser (wasm) clients can only speak WebSocket, so listen on a
     // second address for them. The TCP address above stays canonical: native
     // peers dial it, and it is what service URLs and reply addresses use.
-    let ws_port = match ws_port {
+    let ws_port = match config.ws_port {
         Some(p) => p,
-        None => port
+        None => config
+            .port
             .checked_add(1)
             .ok_or("port 65535 has no room for a default WebSocket port; pass --ws-port")?,
     };
