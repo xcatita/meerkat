@@ -15,6 +15,53 @@ use meerkat_lib::runtime::{parser, Manager, Node};
 use std::collections::HashSet;
 use std::error::Error;
 
+/// #151: load a persistent libp2p identity keypair from `path`, or create and
+/// save one if the file does not yet exist. Using the same file across runs
+/// keeps the node's Peer ID stable, so a web page can embed a fixed server
+/// address. The keypair is stored in libp2p's protobuf encoding.
+///
+/// The file holds a private key, so on Unix it is created atomically with
+/// owner-only (0600) permissions using `create_new`; this leaves no window in
+/// which the key is world-readable and avoids a check-then-write race.
+fn load_or_create_identity(
+    path: &std::path::Path,
+) -> Result<meerkat_lib::net::identity::Keypair, Box<dyn Error>> {
+    use meerkat_lib::net::identity::Keypair;
+    // Try to load an existing key first; only generate one if it is absent.
+    // Reading first (rather than checking `exists()`) avoids a time-of-check
+    // to time-of-use gap between the check and the write.
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Keypair::from_protobuf_encoding(&bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let keypair = Keypair::generate_ed25519();
+            let bytes = keypair.to_protobuf_encoding()?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            // `create_new` fails with AlreadyExists if another process created
+            // the file in the window since our read above; in that case just
+            // load the key it wrote rather than failing startup.
+            match options.open(path) {
+                Ok(mut file) => {
+                    file.write_all(&bytes)?;
+                    Ok(keypair)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let bytes = std::fs::read(path)?;
+                    Ok(Keypair::from_protobuf_encoding(&bytes)?)
+                }
+                Err(e) => Err(Box::new(e)),
+            }
+        }
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -42,6 +89,12 @@ struct Args {
     /// second, WebSocket address. Defaults to `port + 1`.
     #[arg(long = "ws-port")]
     ws_port: Option<u16>,
+
+    /// #151: path to a persistent identity keypair. If the file exists it is
+    /// loaded, giving a stable Peer ID across restarts; otherwise a new keypair
+    /// is generated and saved there. Omit for an ephemeral random identity.
+    #[arg(long = "identity")]
+    identity: Option<std::path::PathBuf>,
 
     /// Bind to loopback/localhost only (force 127.0.0.1 instead of public IP)
     #[arg(long = "local", default_value_t = false)]
@@ -121,9 +174,12 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
                     prog,
                     file,
                     remote_url_map,
-                    args.port,
-                    args.ws_port,
-                    args.local,
+                    ServerConfig {
+                        port: args.port,
+                        ws_port: args.ws_port,
+                        local: args.local,
+                        identity: args.identity,
+                    },
                     interner,
                 )
                 .await
@@ -271,13 +327,20 @@ fn listen_success_addr(reply: NetworkReply) -> Result<Address, Box<dyn Error>> {
     }
 }
 
+/// #151: server runtime configuration, grouped so related settings share a
+/// single home and `run_server` keeps a small, readable signature.
+struct ServerConfig {
+    port: u16,
+    ws_port: Option<u16>,
+    local: bool,
+    identity: Option<std::path::PathBuf>,
+}
+
 async fn run_server(
     prog: Vec<Stmt>,
     input_file: &str,
     remote_url_map: std::collections::HashMap<String, String>,
-    port: u16,
-    ws_port: Option<u16>,
-    local: bool,
+    config: ServerConfig,
     interner: Interner,
 ) -> Result<(), Box<dyn Error>> {
     // #39: the directory the server was started from is the root for serving
@@ -287,13 +350,19 @@ async fn run_server(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf();
-    let mut net = NetworkActor::new(NodeType::Server).await?;
+    // #151: when an identity file is configured, load (or create) a
+    // persistent keypair so the Peer ID is stable across restarts.
+    let identity_keypair = match config.identity {
+        Some(path) => Some(load_or_create_identity(&path)?),
+        None => None,
+    };
+    let mut net = NetworkActor::new_with_identity(NodeType::Server, identity_keypair).await?;
     let mut manager = Manager::new(interner);
-    manager.local = local;
+    manager.local = config.local;
 
     let node_ip = manager.get_node_ip();
-    let listen_ip = if local { "127.0.0.1" } else { "0.0.0.0" };
-    let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, port));
+    let listen_ip = if config.local { "127.0.0.1" } else { "0.0.0.0" };
+    let listen_addr = Address::new(format!("/ip4/{}/tcp/{}", listen_ip, config.port));
     let reply = net
         .handle_command(NetworkCommand::Listen { addr: listen_addr })
         .await;
@@ -311,9 +380,10 @@ async fn run_server(
     // #39: browser (wasm) clients can only speak WebSocket, so listen on a
     // second address for them. The TCP address above stays canonical: native
     // peers dial it, and it is what service URLs and reply addresses use.
-    let ws_port = match ws_port {
+    let ws_port = match config.ws_port {
         Some(p) => p,
-        None => port
+        None => config
+            .port
             .checked_add(1)
             .ok_or("port 65535 has no room for a default WebSocket port; pass --ws-port")?,
     };
