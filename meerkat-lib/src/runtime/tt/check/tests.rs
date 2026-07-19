@@ -917,6 +917,7 @@ fn test_import_member_access_is_skipped() {
         Stmt::Import {
             path: "na".to_string(),
             service_name: remote_svc,
+            explicit_path: false,
         },
         Stmt::Service {
             name: local_svc,
