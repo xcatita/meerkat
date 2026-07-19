@@ -853,7 +853,7 @@ async fn run_client(
                             manager.create_service(name, decls).await.map_err(|e| {
                                 format!("Imported service '{}': {}", manager.interner.get(name), e)
                             })?;
-                            print!("Imported service: {}.", manager.interner.get(service_name));
+                            println!("Imported service: {}.", manager.interner.get(service_name));
                         } else {
                             return Err(format!(
                                 "Service '{}' not found in '{}'",
@@ -862,16 +862,16 @@ async fn run_client(
                             )
                             .into());
                         }
+                    } else {
+                        let mut loaded = Vec::new();
+                        for (name, decls) in services {
+                            manager.create_service(name, decls).await.map_err(|e| {
+                                format!("Imported service '{}': {}", manager.interner.get(name), e)
+                            })?;
+                            loaded.push(manager.interner.get(name).to_string());
+                        }
+                        println!("Imported service(s): {}.", loaded.join(", "));
                     }
-                    let mut loaded = Vec::new();
-                    for (name, decls) in services {
-                        manager.create_service(name, decls).await.map_err(|e| {
-                            format!("Imported service '{}': {}", manager.interner.get(name), e)
-                        })?;
-                        loaded.push(manager.interner.get(name).to_string());
-                    }
-                    print!("Imported service(s): {}.", loaded.join(", "));
-                }
             }
             &Stmt::ActionStmt(_) => {}
             &Stmt::Update { .. } | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
