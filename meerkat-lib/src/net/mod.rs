@@ -8,6 +8,9 @@ pub mod protocol;
 pub mod types;
 
 pub use actor::NetworkActor;
+// #151: re-export libp2p's identity types so downstream crates can construct
+// a persistent keypair without depending on libp2p directly.
+pub use libp2p::identity;
 pub use messages::*;
 pub use mock::MockNetwork;
 pub use network_layer::NetworkLayer;
