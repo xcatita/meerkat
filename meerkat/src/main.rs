@@ -872,6 +872,7 @@ async fn run_client(
                         }
                         println!("Imported service(s): {}.", loaded.join(", "));
                     }
+                }
             }
             &Stmt::ActionStmt(_) => {}
             &Stmt::Update { .. } | &Stmt::Connect { .. } | &Stmt::Watch { .. } => {}
