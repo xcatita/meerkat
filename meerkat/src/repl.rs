@@ -52,6 +52,30 @@ async fn check_watches(watches: &mut [Watch], manager: &mut Manager, repl_env: &
     }
 }
 
+async fn init_network(manager: &mut Manager) -> Result<(), Box<dyn std::error::Error>> {
+    let mut n =
+        meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server).await?;
+    let listen_ip = if manager.local {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    };
+    let listen_addr = meerkat_lib::net::Address::new(format!("/ip4/{}/tcp/0", listen_ip));
+    let reply = n
+        .handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
+        .await;
+    let addr = crate::listen_success_addr(reply)?;
+    let node_ip = manager.get_node_ip();
+    let peer_id = n.local_peer_id();
+    let addr_str = addr
+        .0
+        .replace("0.0.0.0", &node_ip)
+        .replace("127.0.0.1", &node_ip);
+    manager.network = Some(n);
+    manager.set_local_address(format!("{}/p2p/{}", addr_str, peer_id));
+    Ok(())
+}
+
 /// Run the `REPL` loop for interactive execution
 pub async fn run_repl(
     mut manager: Manager,
@@ -79,29 +103,14 @@ pub async fn run_repl(
         println!();
     }
 
-    {
-        //Network initializer always runs
-        let mut n = meerkat_lib::net::NetworkActor::new(meerkat_lib::net::types::NodeType::Server)
-            .await
-            .map_err(|e| format!("Network error: {}", e))?;
-        let listen_ip = if manager.local {
-            "127.0.0.1"
-        } else {
-            "0.0.0.0"
-        };
-        let listen_addr = meerkat_lib::net::Address::new(format!("/ip4/{}/tcp/0", listen_ip));
-        let reply = n
-            .handle_command(meerkat_lib::net::NetworkCommand::Listen { addr: listen_addr })
-            .await;
-        let addr = crate::listen_success_addr(reply)?;
-        let node_ip = manager.get_node_ip();
-        let peer_id = n.local_peer_id();
-        let addr_str = addr
-            .0
-            .replace("0.0.0.0", &node_ip)
-            .replace("127.0.0.1", &node_ip);
-        manager.network = Some(n);
-        manager.set_local_address(format!("{}/p2p/{}", addr_str, peer_id));
+    match init_network(&mut manager).await {
+        Ok(_) => {}
+        Err(e) => {
+            if is_tty {
+                println!("Network error: {}", e);
+                println!("Continuing without network support. Some features may not work.");
+            }
+        }
     }
 
     let mut repl_env: Vec<(Symbol, Value)> = Vec::new();
@@ -224,11 +233,14 @@ async fn exec_stmt(
             explicit_path,
         } => {
             let svc_name_str = manager.interner.get(service_name);
-            if let Some(address) = if path.starts_with("/ip4") {
+            let address = if path.starts_with("/ip4") {
                 Some(path.as_str())
-            } else {
+            } else if !explicit_path {
                 remote_url_map.get(svc_name_str).map(String::as_str)
-            } {
+            } else {
+                None
+            };
+            if let Some(address) = address {
                 manager
                     .remote_services
                     .insert(service_name, meerkat_lib::net::Address::new(address));

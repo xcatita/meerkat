@@ -278,6 +278,23 @@ fn test_integration_import_member_access() {
     assert!(res.is_ok());
 }
 
+//Verify that imports with explicit path bind service names for member access
+#[test]
+fn test_integration_import_path_member_access() {
+    let mut interner = Interner::new();
+    let input = "
+        import s1 from \"./meerkat/tests/s1.mkt\"
+        service s2 {
+            pub def y = s1.x;
+        }
+    ";
+    let parse_result = parse_string(input, &mut interner);
+    assert!(parse_result.is_ok());
+    let stmts = parse_result.unwrap();
+    let res = resolve(&stmts);
+    assert!(res.is_ok());
+}
+
 /// Verify that variables inside assert statements resolve
 #[test]
 fn test_integration_assert_stmt() {
