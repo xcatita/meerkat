@@ -964,4 +964,85 @@ mod tests {
         .expect_err("message-sent replies are not a Listen success");
         assert_eq!(message_sent_err.to_string(), "Unexpected reply");
     }
+
+    // Verify that imports with an explicit path load the target file
+    // and create the imported service.
+    #[tokio::test]
+    async fn test_import_path_member_access() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "meerkat-import-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let main_path = temp_dir.join("main.mkt");
+        let imported_path = temp_dir.join("s1.mkt");
+        std::fs::write(&imported_path, "service s1 { var x = 7; }").unwrap();
+        std::fs::write(
+            &main_path,
+            "import s1 from \"./s1.mkt\"\nservice s2 { pub def y = s1.x; }",
+        )
+        .unwrap();
+
+        let mut interner = Interner::new();
+        let program = parser::parse_file(main_path.to_str().unwrap(), &mut interner).unwrap();
+        let mut manager = Manager::new(interner);
+
+        for stmt in program {
+            match stmt {
+                Stmt::Service { name, decls } => {
+                    manager.create_service(name, decls).await.unwrap();
+                }
+                Stmt::Import {
+                    path,
+                    service_name,
+                    explicit_path,
+                } => {
+                    let base_dir = main_path.parent().unwrap();
+                    let import_path = base_dir.join(path);
+
+                    let import_stmts =
+                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
+                            .unwrap();
+                    let mut services = import_stmts.into_iter().filter_map(|stmt| match stmt {
+                        Stmt::Service { name, decls } => Some((name, decls)),
+                        _ => None,
+                    });
+
+                    if explicit_path {
+                        if let Some((name, decls)) =
+                            services.find(|(name, _)| *name == service_name)
+                        {
+                            manager.create_service(name, decls).await.unwrap();
+                        } else {
+                            panic!("service import was not loaded");
+                        }
+                    } else {
+                        panic!("expected explicit path import");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let s1 = manager.interner.insert("s1");
+        let x = manager.interner.insert("x");
+        let service = manager
+            .services
+            .get(&s1)
+            .expect("imported service should be installed");
+        assert!(
+            service.vars.contains_key(&x),
+            "imported service should contain x"
+        );
+
+        let s2 = manager.interner.insert("s2");
+        let y = manager.interner.insert("y");
+
+        let value = manager.lookup(y, s2, None).await.unwrap();
+        assert_eq!(value, meerkat_lib::runtime::ast::Value::Int { val: 7 });
+    }
 }
