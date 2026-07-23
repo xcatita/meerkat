@@ -249,17 +249,13 @@ async fn exec_stmt(
                     svc_name_str, address
                 )));
             }
-            if let Some(output) = crate::import_from_file(
+            crate::import_from_file(
                 manager,
                 explicit_path,
                 std::path::PathBuf::from(&path),
                 service_name,
             )
-            .await?
-            {
-                return Ok(Some(output));
-            }
-            Ok(None)
+            .await
         }
         Stmt::ActionStmt(action_stmt) => {
             let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)
