@@ -327,6 +327,49 @@ fn listen_success_addr(reply: NetworkReply) -> Result<Address, Box<dyn Error>> {
     }
 }
 
+pub(crate) async fn import_from_file(
+    manager: &mut Manager,
+    explicit_path: bool,
+    import_path: std::path::PathBuf,
+    service_name: Symbol,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let import_stmts = parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
+        .map_err(|e| format!("Import parse error: {}", e))?;
+    let mut services = import_stmts.into_iter().filter_map(|stmt| match stmt {
+        Stmt::Service { name, decls } => Some((name, decls)),
+        _ => None,
+    });
+    if explicit_path {
+        if let Some((name, decls)) = services.find(|(name, _)| *name == service_name) {
+            manager
+                .create_service(name, decls)
+                .await
+                .map_err(|e| format!("Imported service '{}': {}", manager.interner.get(name), e))?;
+            Ok(Some(format!(
+                "Imported service: {}.",
+                manager.interner.get(service_name)
+            )))
+        } else {
+            Err(format!(
+                "Service '{}' not found in '{}'",
+                manager.interner.get(service_name),
+                import_path.to_str().unwrap(),
+            )
+            .into())
+        }
+    } else {
+        let mut loaded = Vec::new();
+        for (name, decls) in services {
+            manager
+                .create_service(name, decls)
+                .await
+                .map_err(|e| format!("Imported service '{}': {}", manager.interner.get(name), e))?;
+            loaded.push(manager.interner.get(name).to_string());
+        }
+        Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
+    }
+}
+
 /// #151: server runtime configuration, grouped so related settings share a
 /// single home and `run_server` keeps a small, readable signature.
 struct ServerConfig {
@@ -838,39 +881,11 @@ async fn run_client(
                         .parent()
                         .unwrap_or(std::path::Path::new("."));
                     let import_path = base_dir.join(path);
-
-                    let import_stmts =
-                        parser::parse_file(import_path.to_str().unwrap(), &mut manager.interner)
-                            .map_err(|e| format!("Import parse error: {}", e))?;
-                    let mut services = import_stmts.into_iter().filter_map(|stmt| match stmt {
-                        Stmt::Service { name, decls } => Some((name, decls)),
-                        _ => None,
-                    });
-                    if explicit_path {
-                        if let Some((name, decls)) =
-                            services.find(|(name, _)| *name == service_name)
-                        {
-                            manager.create_service(name, decls).await.map_err(|e| {
-                                format!("Imported service '{}': {}", manager.interner.get(name), e)
-                            })?;
-                            println!("Imported service: {}.", manager.interner.get(service_name));
-                        } else {
-                            return Err(format!(
-                                "Service '{}' not found in '{}'",
-                                manager.interner.get(service_name),
-                                path
-                            )
-                            .into());
-                        }
-                    } else {
-                        let mut loaded = Vec::new();
-                        for (name, decls) in services {
-                            manager.create_service(name, decls).await.map_err(|e| {
-                                format!("Imported service '{}': {}", manager.interner.get(name), e)
-                            })?;
-                            loaded.push(manager.interner.get(name).to_string());
-                        }
-                        println!("Imported service(s): {}.", loaded.join(", "));
+                    if let Some(output) =
+                        import_from_file(&mut manager, explicit_path, import_path, service_name)
+                            .await?
+                    {
+                        println!("{}", output);
                     }
                 }
             }

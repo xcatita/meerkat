@@ -1,8 +1,8 @@
 use meerkat_lib::runtime::ast::{Expr, Stmt, Value};
 use meerkat_lib::runtime::interner::Symbol;
 use meerkat_lib::runtime::interpreter::{eval, execute, EvalContext, ExecuteEffect};
+use meerkat_lib::runtime::parser::parse_repl;
 use meerkat_lib::runtime::parser::ReplParseResult;
-use meerkat_lib::runtime::parser::{parse_file, parse_repl};
 use meerkat_lib::runtime::Manager;
 
 use directories::ProjectDirs;
@@ -249,38 +249,17 @@ async fn exec_stmt(
                     svc_name_str, address
                 )));
             }
-            let import_stmts = parse_file(&path, &mut manager.interner)
-                .map_err(|e| format!("Import '{}': {}", path, e))?;
-            let mut services = import_stmts.into_iter().filter_map(|stmt| match stmt {
-                Stmt::Service { name, decls } => Some((name, decls)),
-                _ => None,
-            });
-            if explicit_path {
-                if let Some((name, decls)) = services.find(|(name, _)| *name == service_name) {
-                    manager.create_service(name, decls).await.map_err(|e| {
-                        format!("Imported service '{}': {}", manager.interner.get(name), e)
-                    })?;
-                    return Ok(Some(format!(
-                        "Imported service: {}.",
-                        manager.interner.get(service_name)
-                    )));
-                } else {
-                    return Err(format!(
-                        "Service '{}' not found in '{}'",
-                        manager.interner.get(service_name),
-                        path
-                    )
-                    .into());
-                }
+            if let Some(output) = crate::import_from_file(
+                manager,
+                explicit_path,
+                std::path::PathBuf::from(&path),
+                service_name,
+            )
+            .await?
+            {
+                return Ok(Some(output));
             }
-            let mut loaded = Vec::new();
-            for (name, decls) in services {
-                manager.create_service(name, decls).await.map_err(|e| {
-                    format!("Imported service '{}': {}", manager.interner.get(name), e)
-                })?;
-                loaded.push(manager.interner.get(name).to_string());
-            }
-            Ok(Some(format!("Imported service(s): {}.", loaded.join(", "))))
+            Ok(None)
         }
         Stmt::ActionStmt(action_stmt) => {
             let effect = execute(&action_stmt, repl_env, manager, Symbol::empty(), None)
